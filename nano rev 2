@@ -1,0 +1,1790 @@
+// ============================================================
+// LIGHTBAR CONTROLLER - ARDUINO NANO ESP32
+// ============================================================
+//
+// 10 ground-triggered physical inputs
+//
+// HIGH = input OFF
+// LOW  = input ON / grounded
+//
+// ------------------------------------------------------------
+// UART TO MEGA
+// ------------------------------------------------------------
+//
+// D10 = TX -> Mega D19 / RX1
+// D11 = RX <- Mega D18 / TX1
+//
+// 38,400 baud
+//
+// ------------------------------------------------------------
+// UART TO GIGA
+// ------------------------------------------------------------
+//
+// D12 = RX <- GIGA TX
+// D13 = TX -> GIGA RX
+//
+// 38,400 baud
+//
+// ------------------------------------------------------------
+// USB SERIAL MONITOR
+// ------------------------------------------------------------
+//
+// 115,200 baud
+//
+// ------------------------------------------------------------
+// NANO -> MEGA HEARTBEAT
+// ------------------------------------------------------------
+//
+// PING every 5 seconds
+//
+// ------------------------------------------------------------
+// GIGA -> NANO HEARTBEAT
+// ------------------------------------------------------------
+//
+// GIGA_PING
+//
+// ------------------------------------------------------------
+// GIGA WATCHDOG
+// ------------------------------------------------------------
+//
+// If no GIGA_PING is received for 60 seconds:
+//
+// ALL GIGA-generated requests are cleared:
+//
+// OUTERS
+// INTERMEDIATES
+// INNERS
+// TRAFFICBREAKERS
+// LEDS
+// TLEFT
+// TRIGHT
+// TOUT
+// LEFTSIGNAL
+// RIGHTSIGNAL
+//
+// Physical Nano switch requests are NEVER cleared by
+// the GIGA watchdog.
+//
+// ============================================================
+
+
+// ============================================================
+// HARDWARE UARTS
+// ============================================================
+
+HardwareSerial MegaSerial(1);
+HardwareSerial GigaSerial(2);
+
+
+// ============================================================
+// UART PINS
+// ============================================================
+
+// Nano <-> Mega
+
+const int MEGA_RX_PIN = D11;
+const int MEGA_TX_PIN = D10;
+
+
+// Nano <-> GIGA
+
+const int GIGA_RX_PIN = D12;
+const int GIGA_TX_PIN = D13;
+
+
+// ============================================================
+// BAUD RATES
+// ============================================================
+
+const unsigned long MEGA_BAUD = 38400;
+const unsigned long GIGA_BAUD = 38400;
+const unsigned long USB_BAUD  = 115200;
+
+
+// ============================================================
+// NUMBER OF COMMANDS / INPUTS
+// ============================================================
+
+const byte NUM_INPUTS = 10;
+
+
+// ============================================================
+// COMMAND INDEXES
+// ============================================================
+
+const byte CMD_OUTERS          = 0;
+const byte CMD_INTERMEDIATES   = 1;
+const byte CMD_INNERS          = 2;
+const byte CMD_TRAFFICBREAKERS = 3;
+const byte CMD_LEDS            = 4;
+
+const byte CMD_TLEFT           = 5;
+const byte CMD_TRIGHT          = 6;
+const byte CMD_TOUT            = 7;
+
+const byte CMD_LEFTSIGNAL      = 8;
+const byte CMD_RIGHTSIGNAL     = 9;
+
+
+// ============================================================
+// PHYSICAL INPUT PINS
+// ============================================================
+//
+// Input 1  OUTERS          = D2
+// Input 2  INTERMEDIATES   = D3
+// Input 3  INNERS          = D4
+// Input 4  TRAFFICBREAKERS = D5
+// Input 5  LEDS            = D6
+// Input 6  TLEFT           = D7
+// Input 7  TRIGHT          = D8
+// Input 8  TOUT            = D9
+// Input 9  LEFTSIGNAL      = A0
+// Input 10 RIGHTSIGNAL     = A1
+//
+// ============================================================
+
+const int inputPins[NUM_INPUTS] = {
+
+  D2,
+  D3,
+  D4,
+  D5,
+  D6,
+  D7,
+  D8,
+  D9,
+  A0,
+  A1
+
+};
+
+
+// ============================================================
+// COMMAND NAMES
+// ============================================================
+
+const char* inputNames[NUM_INPUTS] = {
+
+  "OUTERS",
+  "INTERMEDIATES",
+  "INNERS",
+  "TRAFFICBREAKERS",
+  "LEDS",
+  "TLEFT",
+  "TRIGHT",
+  "TOUT",
+  "LEFTSIGNAL",
+  "RIGHTSIGNAL"
+
+};
+
+
+// ============================================================
+// PHYSICAL INPUT STATE
+// ============================================================
+//
+// currentState:
+//
+// HIGH = physical switch OFF
+// LOW  = physical switch ON
+//
+// physicalRequest:
+//
+// false = physical switch not requesting command
+// true  = physical switch requesting command
+//
+// ============================================================
+
+bool currentState[NUM_INPUTS];
+
+bool physicalRequest[NUM_INPUTS];
+
+
+// ============================================================
+// GIGA REQUEST STATE
+// ============================================================
+//
+// Keeps GIGA requests completely separate from physical
+// requests.
+//
+// ============================================================
+
+bool gigaRequest[NUM_INPUTS];
+
+
+// ============================================================
+// MEGA OUTPUT STATE
+// ============================================================
+//
+// Tracks the final state currently commanded to the Mega.
+//
+// Traffic Advisor modes are handled separately.
+//
+// ============================================================
+
+bool megaState[NUM_INPUTS];
+
+
+// ============================================================
+// INPUT DEBOUNCE
+// ============================================================
+
+unsigned long lastChangeTime[NUM_INPUTS];
+
+const unsigned long DEBOUNCE_TIME = 50;
+
+
+// ============================================================
+// NANO -> MEGA HEARTBEAT
+// ============================================================
+
+unsigned long lastMegaHeartbeat = 0;
+
+const unsigned long MEGA_HEARTBEAT_INTERVAL = 5000;
+
+
+// ============================================================
+// GIGA WATCHDOG
+// ============================================================
+
+unsigned long lastGigaHeartbeat = 0;
+
+const unsigned long GIGA_TIMEOUT = 60000;
+
+bool gigaConnected = false;
+
+
+// ============================================================
+// TRAFFIC ADVISOR ARBITRATION
+// ============================================================
+//
+// Traffic Advisor commands:
+//
+// TLEFT
+// TRIGHT
+// TOUT
+//
+// Only one can be active on the Mega at a time.
+//
+// The most recently activated request wins.
+//
+// Physical and GIGA activation order are tracked separately.
+//
+// ============================================================
+
+unsigned long taActivationCounter = 0;
+
+unsigned long physicalTAOrder[NUM_INPUTS];
+unsigned long gigaTAOrder[NUM_INPUTS];
+
+
+// Current TA mode commanded to Mega.
+//
+// -1 = none
+//  5 = TLEFT
+//  6 = TRIGHT
+//  7 = TOUT
+
+int currentMegaTAMode = -1;
+
+
+// ============================================================
+// FUNCTION PROTOTYPES
+// ============================================================
+
+void checkPhysicalInputs();
+
+void processPhysicalStart(byte command);
+void processPhysicalStop(byte command);
+
+void checkGigaSerial();
+void processGigaMessage(String message);
+
+void processGigaStart(byte command);
+void processGigaStop(byte command);
+
+void updateMergedOutput(byte command);
+
+void updateTrafficAdvisorState();
+int findDesiredTrafficAdvisor();
+
+void sendStartToMega(byte command);
+void sendStopToMega(byte command);
+
+void sendMegaPing();
+
+void updateGigaWatchdog();
+void clearGigaControlledOutputs();
+
+int findCommandIndex(String command);
+
+bool isTrafficAdvisorCommand(byte command);
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  // ----------------------------------------------------------
+  // USB SERIAL MONITOR
+  // ----------------------------------------------------------
+
+  Serial.begin(USB_BAUD);
+
+  delay(500);
+
+
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println(" LIGHTBAR NANO ESP32");
+  Serial.println("=================================");
+  Serial.println();
+
+
+  // ----------------------------------------------------------
+  // UART TO MEGA
+  // ----------------------------------------------------------
+
+  MegaSerial.begin(
+    MEGA_BAUD,
+    SERIAL_8N1,
+    MEGA_RX_PIN,
+    MEGA_TX_PIN
+  );
+
+
+  Serial.println("Mega UART started.");
+
+  Serial.print("Mega TX pin: D");
+  Serial.println(10);
+
+  Serial.print("Mega RX pin: D");
+  Serial.println(11);
+
+  Serial.print("Mega UART baud: ");
+  Serial.println(MEGA_BAUD);
+
+  Serial.println();
+
+
+  // ----------------------------------------------------------
+  // UART TO GIGA
+  // ----------------------------------------------------------
+
+  GigaSerial.begin(
+    GIGA_BAUD,
+    SERIAL_8N1,
+    GIGA_RX_PIN,
+    GIGA_TX_PIN
+  );
+
+
+  Serial.println("GIGA UART started.");
+
+  Serial.print("GIGA RX pin: D");
+  Serial.println(12);
+
+  Serial.print("GIGA TX pin: D");
+  Serial.println(13);
+
+  Serial.print("GIGA UART baud: ");
+  Serial.println(GIGA_BAUD);
+
+  Serial.println();
+
+
+  // ----------------------------------------------------------
+  // INITIALIZE COMMAND STATES
+  // ----------------------------------------------------------
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    physicalRequest[i] = false;
+
+    gigaRequest[i] = false;
+
+    megaState[i] = false;
+
+    physicalTAOrder[i] = 0;
+
+    gigaTAOrder[i] = 0;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // CONFIGURE PHYSICAL INPUTS
+  // ----------------------------------------------------------
+
+  Serial.println("Configuring physical inputs...");
+
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    pinMode(
+      inputPins[i],
+      INPUT_PULLUP
+    );
+
+
+    currentState[i] =
+      digitalRead(inputPins[i]);
+
+
+    lastChangeTime[i] = 0;
+
+
+    // --------------------------------------------------------
+    // Determine initial physical request state.
+    // --------------------------------------------------------
+
+    physicalRequest[i] =
+      (currentState[i] == LOW);
+
+
+    // --------------------------------------------------------
+    // Track initially-active Traffic Advisor inputs.
+    // --------------------------------------------------------
+
+    if (
+      physicalRequest[i] &&
+      isTrafficAdvisorCommand(i)
+    ) {
+
+      taActivationCounter++;
+
+      physicalTAOrder[i] =
+        taActivationCounter;
+
+    }
+
+
+    // --------------------------------------------------------
+    // Print input information.
+    // --------------------------------------------------------
+
+    Serial.print("Input ");
+    Serial.print(i + 1);
+
+    Serial.print(" - ");
+
+    Serial.print(
+      inputNames[i]
+    );
+
+    Serial.print(" - ");
+
+    if (i < 8) {
+
+      Serial.print("D");
+      Serial.println(i + 2);
+
+    }
+
+    else if (i == CMD_LEFTSIGNAL) {
+
+      Serial.println("A0");
+
+    }
+
+    else {
+
+      Serial.println("A1");
+
+    }
+
+  }
+
+
+  // ----------------------------------------------------------
+  // PRINT INITIAL INPUT STATES
+  // ----------------------------------------------------------
+
+  Serial.println();
+
+  Serial.println(
+    "Initial physical input states:"
+  );
+
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    Serial.print("  ");
+
+    Serial.print(
+      inputNames[i]
+    );
+
+    Serial.print(": ");
+
+
+    if (physicalRequest[i]) {
+
+      Serial.println("ACTIVE");
+
+    }
+
+    else {
+
+      Serial.println("OFF");
+
+    }
+
+  }
+
+
+  // ----------------------------------------------------------
+  // INITIAL PING TO MEGA
+  // ----------------------------------------------------------
+
+  Serial.println();
+
+  Serial.println(
+    "Sending initial PING to Mega..."
+  );
+
+
+  MegaSerial.println("PING");
+
+  lastMegaHeartbeat = millis();
+
+
+  // ----------------------------------------------------------
+  // GIGA WATCHDOG STATUS
+  // ----------------------------------------------------------
+
+  Serial.println();
+
+  Serial.println(
+    "GIGA watchdog waiting for GIGA_PING."
+  );
+
+  Serial.println(
+    "GIGA watchdog timeout: 60 seconds."
+  );
+
+  Serial.println();
+
+
+  Serial.println(
+    "Nano ESP32 ready."
+  );
+
+  Serial.println();
+
+}
+
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+
+  // ----------------------------------------------------------
+  // PHYSICAL SWITCHES
+  // ----------------------------------------------------------
+
+  checkPhysicalInputs();
+
+
+  // ----------------------------------------------------------
+  // GIGA COMMUNICATION
+  // ----------------------------------------------------------
+
+  checkGigaSerial();
+
+
+  // ----------------------------------------------------------
+  // NANO -> MEGA HEARTBEAT
+  // ----------------------------------------------------------
+
+  if (
+    millis() - lastMegaHeartbeat
+    >= MEGA_HEARTBEAT_INTERVAL
+  ) {
+
+    lastMegaHeartbeat =
+      millis();
+
+    sendMegaPing();
+
+  }
+
+
+  // ----------------------------------------------------------
+  // GIGA WATCHDOG
+  // ----------------------------------------------------------
+
+  updateGigaWatchdog();
+
+
+  // ----------------------------------------------------------
+  // MESSAGES FROM MEGA
+  // ----------------------------------------------------------
+
+  while (
+    MegaSerial.available()
+  ) {
+
+    String message =
+      MegaSerial.readStringUntil('\n');
+
+
+    message.trim();
+
+
+    if (
+      message.length() > 0
+    ) {
+
+      Serial.print(
+        "MEGA -> NANO: "
+      );
+
+      Serial.println(
+        message
+      );
+
+    }
+
+  }
+
+}
+
+
+// ============================================================
+// CHECK PHYSICAL INPUTS
+// ============================================================
+
+void checkPhysicalInputs() {
+
+  unsigned long now =
+    millis();
+
+
+  for (
+    byte i = 0;
+    i < NUM_INPUTS;
+    i++
+  ) {
+
+    bool reading =
+      digitalRead(
+        inputPins[i]
+      );
+
+
+    // --------------------------------------------------------
+    // INPUT STATE CHANGED
+    // --------------------------------------------------------
+
+    if (
+      reading != currentState[i]
+    ) {
+
+
+      // Start debounce timer.
+
+      if (
+        lastChangeTime[i] == 0
+      ) {
+
+        lastChangeTime[i] =
+          now;
+
+      }
+
+
+      // ------------------------------------------------------
+      // DEBOUNCE COMPLETE
+      // ------------------------------------------------------
+
+      if (
+        now - lastChangeTime[i]
+        >= DEBOUNCE_TIME
+      ) {
+
+        currentState[i] =
+          reading;
+
+
+        lastChangeTime[i] =
+          0;
+
+
+        // ====================================================
+        // INPUT GROUNDED
+        // ====================================================
+
+        if (
+          currentState[i] == LOW
+        ) {
+
+          processPhysicalStart(i);
+
+        }
+
+
+        // ====================================================
+        // INPUT RELEASED
+        // ====================================================
+
+        else {
+
+          processPhysicalStop(i);
+
+        }
+
+      }
+
+    }
+
+
+    // --------------------------------------------------------
+    // INPUT DID NOT CHANGE
+    // --------------------------------------------------------
+
+    else {
+
+      lastChangeTime[i] = 0;
+
+    }
+
+  }
+
+}
+
+
+// ============================================================
+// PHYSICAL SWITCH START
+// ============================================================
+
+void processPhysicalStart(
+  byte command
+) {
+
+  physicalRequest[command] =
+    true;
+
+
+  Serial.print("INPUT ");
+
+  Serial.print(
+    command + 1
+  );
+
+  Serial.print(" - ");
+
+  Serial.print(
+    inputNames[command]
+  );
+
+  Serial.println(
+    " ACTIVE"
+  );
+
+
+  // ----------------------------------------------------------
+  // TRAFFIC ADVISOR
+  // ----------------------------------------------------------
+
+  if (
+    isTrafficAdvisorCommand(command)
+  ) {
+
+    taActivationCounter++;
+
+
+    physicalTAOrder[command] =
+      taActivationCounter;
+
+
+    updateTrafficAdvisorState();
+
+  }
+
+
+  // ----------------------------------------------------------
+  // NORMAL OUTPUT
+  // ----------------------------------------------------------
+
+  else {
+
+    updateMergedOutput(command);
+
+  }
+
+}
+
+
+// ============================================================
+// PHYSICAL SWITCH STOP
+// ============================================================
+
+void processPhysicalStop(
+  byte command
+) {
+
+  physicalRequest[command] =
+    false;
+
+
+  Serial.print("INPUT ");
+
+  Serial.print(
+    command + 1
+  );
+
+  Serial.print(" - ");
+
+  Serial.print(
+    inputNames[command]
+  );
+
+  Serial.println(
+    " OFF"
+  );
+
+
+  // ----------------------------------------------------------
+  // TRAFFIC ADVISOR
+  // ----------------------------------------------------------
+
+  if (
+    isTrafficAdvisorCommand(command)
+  ) {
+
+    physicalTAOrder[command] =
+      0;
+
+
+    updateTrafficAdvisorState();
+
+  }
+
+
+  // ----------------------------------------------------------
+  // NORMAL OUTPUT
+  // ----------------------------------------------------------
+
+  else {
+
+    updateMergedOutput(command);
+
+  }
+
+}
+
+
+// ============================================================
+// CHECK GIGA SERIAL
+// ============================================================
+
+void checkGigaSerial() {
+
+  while (
+    GigaSerial.available()
+  ) {
+
+    String message =
+      GigaSerial.readStringUntil('\n');
+
+
+    message.trim();
+
+
+    if (
+      message.length() > 0
+    ) {
+
+      Serial.print(
+        "GIGA -> NANO: "
+      );
+
+      Serial.println(
+        message
+      );
+
+
+      processGigaMessage(
+        message
+      );
+
+    }
+
+  }
+
+}
+
+
+// ============================================================
+// PROCESS MESSAGE FROM GIGA
+// ============================================================
+
+void processGigaMessage(
+  String message
+) {
+
+  // ----------------------------------------------------------
+  // GIGA HEARTBEAT
+  // ----------------------------------------------------------
+
+  if (
+    message == "GIGA_PING"
+  ) {
+
+    lastGigaHeartbeat =
+      millis();
+
+
+    if (
+      !gigaConnected
+    ) {
+
+      gigaConnected =
+        true;
+
+
+      Serial.println(
+        "GIGA communication established."
+      );
+
+    }
+
+
+    return;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // DO NOT ACCEPT GIGA CONTROL COMMANDS UNTIL A HEARTBEAT
+  // HAS BEEN RECEIVED.
+  // ----------------------------------------------------------
+
+  if (
+    !gigaConnected
+  ) {
+
+    Serial.println(
+      "GIGA command ignored - no active GIGA heartbeat."
+    );
+
+    return;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // START COMMAND
+  // ----------------------------------------------------------
+
+  if (
+    message.startsWith("START ")
+  ) {
+
+    String commandName =
+      message.substring(6);
+
+
+    commandName.trim();
+
+
+    int command =
+      findCommandIndex(
+        commandName
+      );
+
+
+    if (
+      command >= 0
+    ) {
+
+      processGigaStart(
+        command
+      );
+
+    }
+
+    else {
+
+      Serial.print(
+        "Unknown GIGA START command: "
+      );
+
+      Serial.println(
+        commandName
+      );
+
+    }
+
+
+    return;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // STOP COMMAND
+  // ----------------------------------------------------------
+
+  if (
+    message.startsWith("STOP ")
+  ) {
+
+    String commandName =
+      message.substring(5);
+
+
+    commandName.trim();
+
+
+    int command =
+      findCommandIndex(
+        commandName
+      );
+
+
+    if (
+      command >= 0
+    ) {
+
+      processGigaStop(
+        command
+      );
+
+    }
+
+    else {
+
+      Serial.print(
+        "Unknown GIGA STOP command: "
+      );
+
+      Serial.println(
+        commandName
+      );
+
+    }
+
+
+    return;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // UNKNOWN MESSAGE
+  // ----------------------------------------------------------
+
+  Serial.print(
+    "Unknown GIGA message: "
+  );
+
+  Serial.println(
+    message
+  );
+
+}
+
+
+// ============================================================
+// GIGA START
+// ============================================================
+
+void processGigaStart(
+  byte command
+) {
+
+  // ----------------------------------------------------------
+  // IGNORE DUPLICATE START
+  // ----------------------------------------------------------
+
+  if (
+    gigaRequest[command]
+  ) {
+
+    return;
+
+  }
+
+
+  gigaRequest[command] =
+    true;
+
+
+  Serial.print(
+    "GIGA REQUEST ON: "
+  );
+
+  Serial.println(
+    inputNames[command]
+  );
+
+
+  // ----------------------------------------------------------
+  // TRAFFIC ADVISOR
+  // ----------------------------------------------------------
+
+  if (
+    isTrafficAdvisorCommand(command)
+  ) {
+
+    taActivationCounter++;
+
+
+    gigaTAOrder[command] =
+      taActivationCounter;
+
+
+    updateTrafficAdvisorState();
+
+  }
+
+
+  // ----------------------------------------------------------
+  // NORMAL OUTPUT
+  // ----------------------------------------------------------
+
+  else {
+
+    updateMergedOutput(command);
+
+  }
+
+}
+
+
+// ============================================================
+// GIGA STOP
+// ============================================================
+
+void processGigaStop(
+  byte command
+) {
+
+  // ----------------------------------------------------------
+  // IGNORE DUPLICATE STOP
+  // ----------------------------------------------------------
+
+  if (
+    !gigaRequest[command]
+  ) {
+
+    return;
+
+  }
+
+
+  gigaRequest[command] =
+    false;
+
+
+  Serial.print(
+    "GIGA REQUEST OFF: "
+  );
+
+  Serial.println(
+    inputNames[command]
+  );
+
+
+  // ----------------------------------------------------------
+  // TRAFFIC ADVISOR
+  // ----------------------------------------------------------
+
+  if (
+    isTrafficAdvisorCommand(command)
+  ) {
+
+    gigaTAOrder[command] =
+      0;
+
+
+    updateTrafficAdvisorState();
+
+  }
+
+
+  // ----------------------------------------------------------
+  // NORMAL OUTPUT
+  // ----------------------------------------------------------
+
+  else {
+
+    updateMergedOutput(command);
+
+  }
+
+}
+
+
+// ============================================================
+// UPDATE MERGED OUTPUT
+// ============================================================
+//
+// For normal functions:
+//
+// FINAL OUTPUT =
+//
+// physical request
+//       OR
+// GIGA request
+//
+// This includes:
+//
+// OUTERS
+// INTERMEDIATES
+// INNERS
+// TRAFFICBREAKERS
+// LEDS
+// LEFTSIGNAL
+// RIGHTSIGNAL
+//
+// ============================================================
+
+void updateMergedOutput(
+  byte command
+) {
+
+  bool desiredState =
+
+    physicalRequest[command]
+
+    ||
+
+    gigaRequest[command];
+
+
+  // ----------------------------------------------------------
+  // NO CHANGE
+  // ----------------------------------------------------------
+
+  if (
+    desiredState ==
+    megaState[command]
+  ) {
+
+    return;
+
+  }
+
+
+  megaState[command] =
+    desiredState;
+
+
+  // ----------------------------------------------------------
+  // START
+  // ----------------------------------------------------------
+
+  if (
+    desiredState
+  ) {
+
+    sendStartToMega(
+      command
+    );
+
+  }
+
+
+  // ----------------------------------------------------------
+  // STOP
+  // ----------------------------------------------------------
+
+  else {
+
+    sendStopToMega(
+      command
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// UPDATE TRAFFIC ADVISOR
+// ============================================================
+
+void updateTrafficAdvisorState() {
+
+  int desiredMode =
+    findDesiredTrafficAdvisor();
+
+
+  // ----------------------------------------------------------
+  // ALREADY RUNNING DESIRED MODE
+  // ----------------------------------------------------------
+
+  if (
+    desiredMode ==
+    currentMegaTAMode
+  ) {
+
+    return;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // STOP CURRENT MODE
+  // ----------------------------------------------------------
+
+  if (
+    currentMegaTAMode >= 0
+  ) {
+
+    sendStopToMega(
+      currentMegaTAMode
+    );
+
+  }
+
+
+  currentMegaTAMode =
+    desiredMode;
+
+
+  // ----------------------------------------------------------
+  // START NEW MODE
+  // ----------------------------------------------------------
+
+  if (
+    currentMegaTAMode >= 0
+  ) {
+
+    sendStartToMega(
+      currentMegaTAMode
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// FIND DESIRED TRAFFIC ADVISOR MODE
+// ============================================================
+//
+// Searches:
+//
+// TLEFT
+// TRIGHT
+// TOUT
+//
+// across:
+//
+// Physical requests
+// GIGA requests
+//
+// Newest activation wins.
+//
+// ============================================================
+
+int findDesiredTrafficAdvisor() {
+
+  int selectedCommand =
+    -1;
+
+
+  unsigned long newestOrder =
+    0;
+
+
+  for (
+    byte command = CMD_TLEFT;
+    command <= CMD_TOUT;
+    command++
+  ) {
+
+
+    // --------------------------------------------------------
+    // PHYSICAL REQUEST
+    // --------------------------------------------------------
+
+    if (
+
+      physicalRequest[command]
+
+      &&
+
+      physicalTAOrder[command]
+      > newestOrder
+
+    ) {
+
+      newestOrder =
+        physicalTAOrder[command];
+
+
+      selectedCommand =
+        command;
+
+    }
+
+
+    // --------------------------------------------------------
+    // GIGA REQUEST
+    // --------------------------------------------------------
+
+    if (
+
+      gigaRequest[command]
+
+      &&
+
+      gigaTAOrder[command]
+      > newestOrder
+
+    ) {
+
+      newestOrder =
+        gigaTAOrder[command];
+
+
+      selectedCommand =
+        command;
+
+    }
+
+  }
+
+
+  return selectedCommand;
+
+}
+
+
+// ============================================================
+// SEND START TO MEGA
+// ============================================================
+
+void sendStartToMega(
+  byte command
+) {
+
+  MegaSerial.print(
+    "START "
+  );
+
+
+  MegaSerial.println(
+    inputNames[command]
+  );
+
+
+  Serial.print(
+    "NANO -> MEGA: START "
+  );
+
+
+  Serial.println(
+    inputNames[command]
+  );
+
+}
+
+
+// ============================================================
+// SEND STOP TO MEGA
+// ============================================================
+
+void sendStopToMega(
+  byte command
+) {
+
+  MegaSerial.print(
+    "STOP "
+  );
+
+
+  MegaSerial.println(
+    inputNames[command]
+  );
+
+
+  Serial.print(
+    "NANO -> MEGA: STOP "
+  );
+
+
+  Serial.println(
+    inputNames[command]
+  );
+
+}
+
+
+// ============================================================
+// SEND PING TO MEGA
+// ============================================================
+
+void sendMegaPing() {
+
+  MegaSerial.println(
+    "PING"
+  );
+
+
+  Serial.println(
+    "NANO -> MEGA: PING"
+  );
+
+}
+
+
+// ============================================================
+// GIGA WATCHDOG
+// ============================================================
+//
+// Once communication has been established:
+//
+// If 60 seconds pass without GIGA_PING:
+//
+// ALL GIGA requests are cleared.
+//
+// Physical requests remain completely untouched.
+//
+// ============================================================
+
+void updateGigaWatchdog() {
+
+  // ----------------------------------------------------------
+  // GIGA HAS NEVER CONNECTED OR IS ALREADY TIMED OUT
+  // ----------------------------------------------------------
+
+  if (
+    !gigaConnected
+  ) {
+
+    return;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // CHECK FOR 60 SECOND TIMEOUT
+  // ----------------------------------------------------------
+
+  if (
+
+    millis() - lastGigaHeartbeat
+
+    >= GIGA_TIMEOUT
+
+  ) {
+
+    gigaConnected =
+      false;
+
+
+    Serial.println();
+
+    Serial.println(
+      "================================="
+    );
+
+    Serial.println(
+      " WARNING: GIGA HEARTBEAT LOST"
+    );
+
+    Serial.println(
+      " Clearing ALL GIGA requests"
+    );
+
+    Serial.println(
+      " Physical controls remain active"
+    );
+
+    Serial.println(
+      "================================="
+    );
+
+    Serial.println();
+
+
+    clearGigaControlledOutputs();
+
+  }
+
+}
+
+
+// ============================================================
+// CLEAR ALL GIGA REQUESTS
+// ============================================================
+//
+// This now includes:
+//
+// OUTERS
+// INTERMEDIATES
+// INNERS
+// TRAFFICBREAKERS
+// LEDS
+// TLEFT
+// TRIGHT
+// TOUT
+// LEFTSIGNAL
+// RIGHTSIGNAL
+//
+// ONLY gigaRequest[] is cleared.
+//
+// physicalRequest[] is NEVER modified.
+//
+// ============================================================
+
+void clearGigaControlledOutputs() {
+
+  bool taChanged =
+    false;
+
+
+  for (
+    byte command = 0;
+    command < NUM_INPUTS;
+    command++
+  ) {
+
+
+    // --------------------------------------------------------
+    // NO GIGA REQUEST ACTIVE
+    // --------------------------------------------------------
+
+    if (
+      !gigaRequest[command]
+    ) {
+
+      continue;
+
+    }
+
+
+    Serial.print(
+      "WATCHDOG clearing GIGA request: "
+    );
+
+
+    Serial.println(
+      inputNames[command]
+    );
+
+
+    // --------------------------------------------------------
+    // CLEAR ONLY GIGA'S REQUEST
+    // --------------------------------------------------------
+
+    gigaRequest[command] =
+      false;
+
+
+    // --------------------------------------------------------
+    // TRAFFIC ADVISOR
+    // --------------------------------------------------------
+
+    if (
+      isTrafficAdvisorCommand(command)
+    ) {
+
+      gigaTAOrder[command] =
+        0;
+
+
+      taChanged =
+        true;
+
+    }
+
+
+    // --------------------------------------------------------
+    // NORMAL OUTPUT / TURN SIGNAL
+    // --------------------------------------------------------
+
+    else {
+
+      updateMergedOutput(
+        command
+      );
+
+    }
+
+  }
+
+
+  // ----------------------------------------------------------
+  // RECALCULATE TA ONCE AFTER ALL GIGA TA REQUESTS HAVE
+  // BEEN REMOVED.
+  //
+  // This allows an active physical TA switch to resume.
+  // ----------------------------------------------------------
+
+  if (
+    taChanged
+  ) {
+
+    updateTrafficAdvisorState();
+
+  }
+
+}
+
+
+// ============================================================
+// FIND COMMAND BY NAME
+// ============================================================
+
+int findCommandIndex(
+  String command
+) {
+
+  for (
+    byte i = 0;
+    i < NUM_INPUTS;
+    i++
+  ) {
+
+    if (
+      command.equalsIgnoreCase(
+        inputNames[i]
+      )
+    ) {
+
+      return i;
+
+    }
+
+  }
+
+
+  return -1;
+
+}
+
+
+// ============================================================
+// CHECK WHETHER COMMAND IS A TRAFFIC ADVISOR COMMAND
+// ============================================================
+
+bool isTrafficAdvisorCommand(
+  byte command
+) {
+
+  return (
+
+    command == CMD_TLEFT
+
+    ||
+
+    command == CMD_TRIGHT
+
+    ||
+
+    command == CMD_TOUT
+
+  );
+
+}
