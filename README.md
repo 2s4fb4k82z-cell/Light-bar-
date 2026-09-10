@@ -1,358 +1,455 @@
-# Lightbar Controller
+Arduino Lightbar Controller
 
-A modular, Arduino-based vehicle lightbar control system designed around separate **input**, **output**, and future **touchscreen/vehicle-data** controllers.
+A modular Arduino-based vehicle lightbar control system using an Arduino Nano ESP32, Arduino Mega 2560, and planned Arduino GIGA R1 WiFi with GIGA Display Shield.
 
-The current system uses:
+The system separates physical control inputs, touchscreen control, output control, Traffic Advisor sequencing, communication monitoring, and future vehicle diagnostic functions across multiple controllers.
 
-* **Arduino Nano ESP32** — physical input controller
-* **Arduino Mega 2560** — lightbar output controller
+⸻
 
-Future development will add:
+System Architecture
 
-* **Arduino GIGA R1 WiFi**
-* **Touchscreen interface**
-* **Touchscreen lightbar controls**
-* **OBD-II / CAN vehicle gauges and diagnostics**
+Current / planned architecture:
 
-The design intentionally separates physical controls from the future touchscreen system so that physical lightbar controls can continue operating if the touchscreen or GIGA becomes unavailable.
+PHYSICAL SWITCHES
+       │
+       ▼
+┌─────────────────────┐
+│  Arduino Nano ESP32 │◄──────── UART ──────── Arduino GIGA
+│                     │                         + Display Shield
+│  Input Controller   │                         Touch Controller
+│  Command Arbiter    │                         Diagnostic Gauges
+│  Watchdog Manager   │
+└──────────┬──────────┘
+           │
+           │ UART
+           ▼
+┌─────────────────────┐
+│ Arduino Mega 2560   │
+│                     │
+│ Output Controller   │
+│ Traffic Advisor     │
+│ Mega Watchdog       │
+└──────────┬──────────┘
+           │
+           ▼
+       LIGHTBAR
 
----
-
-# System Overview
-
-## Arduino Nano ESP32 — Input Controller
-
-The Nano ESP32 monitors 10 ground-triggered physical control inputs.
-
-It is responsible for:
-
-* Monitoring physical vehicle/control inputs
-* Debouncing input signals
-* Detecting ON/OFF state changes
-* Sending START/STOP commands
-* Sending a heartbeat (`PING`) every 5 seconds
-* Communicating with the Mega over hardware UART
-* Monitoring messages returned by the Mega
-
----
-
-## Arduino Mega 2560 — Output Controller
-
-The Mega is responsible for controlling the actual lightbar functions.
+The Nano ESP32 is the central command controller.
 
 It:
 
-* Receives commands from the Nano
-* Controls 8 individual Traffic Advisor outputs
-* Controls 5 direct lightbar outputs
-* Generates Traffic Advisor patterns
-* Handles Traffic Advisor priority
-* Integrates left/right turn signals with the TA outputs
-* Monitors the Nano heartbeat
-* Provides communication-loss warning
-* Shuts down all lightbar outputs after a communication timeout
+* Reads the physical switches.
+* Receives commands from the GIGA.
+* Keeps physical and GIGA requests separate.
+* Determines the effective requested state.
+* Sends final commands to the Mega.
+* Sends a heartbeat to the Mega.
+* Monitors the GIGA heartbeat.
+* Protects physical controls from GIGA communication failures.
 
----
+The Mega 2560 controls the actual lightbar outputs and Traffic Advisor sequences.
 
-## Arduino GIGA R1 WiFi — Planned Touchscreen / Vehicle Controller
+⸻
 
-A future Arduino GIGA R1 WiFi with touchscreen will provide an in-cab graphical interface.
+Arduino Nano ESP32
 
-The GIGA will have two primary functions:
+Physical Inputs
 
-### Lightbar Control
+The Nano has 10 ground-triggered physical inputs.
 
-The touchscreen will provide an additional method of controlling the lightbar system.
+HIGH = Input OFF
+LOW  = Input ON / Grounded
 
-The existing physical controls connected to the Nano will remain available independently.
+All physical inputs use:
 
-### OBD-II / CAN Gauge Display
-
-The GIGA will also communicate with the truck's vehicle network and display available OBD-II/CAN information.
-
-Planned functionality includes:
-
-* Digital gauges
-* Vehicle information
-* Warning indicators
-* Diagnostic trouble codes
-* Vehicle-specific CAN information where available
-
----
-
-# Current System Architecture
-
-```text
-             PHYSICAL VEHICLE CONTROLS
-                       │
-                       ▼
-             ┌───────────────────┐
-             │  INPUT INTERFACE  │
-             │    12V → 3.3V     │
-             └─────────┬─────────┘
-                       │
-                       ▼
-             ┌───────────────────┐
-             │   NANO ESP32      │
-             │                   │
-             │ Physical Inputs   │
-             │ Debouncing        │
-             │ Command Generator │
-             │ Heartbeat         │
-             └─────────┬─────────┘
-                       │
-                  UART 38400
-                       │
-                       ▼
-             ┌───────────────────┐
-             │    MEGA 2560      │
-             │                   │
-             │ Command Processor │
-             │ TA Controller     │
-             │ Output Controller │
-             │ Watchdog          │
-             └─────────┬─────────┘
-                       │
-                       ▼
-             ┌───────────────────┐
-             │  OUTPUT DRIVERS   │
-             └─────────┬─────────┘
-                       │
-                       ▼
-                    LIGHTBAR
-```
-
----
-
-# Planned System Architecture
-
-The completed system is expected to use three primary controllers:
-
-```text
-                   PHYSICAL CONTROLS
-                          │
-                          ▼
-                 ┌─────────────────┐
-                 │   NANO ESP32    │
-                 │                 │
-                 │ Physical Input  │
-                 │ Controller      │
-                 └────────┬────────┘
-                          │
-                          │ Commands
-                          ▼
-                 ┌─────────────────┐
-                 │    MEGA 2560    │
-                 │                 │
-                 │ Lightbar Output │
-                 │ Controller      │
-                 └────────┬────────┘
-                          │
-                          ▼
-                   OUTPUT DRIVERS
-                          │
-                          ▼
-                       LIGHTBAR
-
-
-                 ┌─────────────────┐
-                 │  ARDUINO GIGA   │
-                 │    R1 WiFi      │
-                 │                 │
-                 │   Touchscreen   │
-                 │   Controller    │
-                 └────────┬────────┘
-                          │
-                ┌─────────┴─────────┐
-                │                   │
-                ▼                   ▼
-         LIGHTBAR CONTROL       OBD-II / CAN
-                │                   │
-                ▼                   ▼
-        NANO / CONTROL         TRUCK ECU /
-            SYSTEM             VEHICLE CAN
-```
-
-The GIGA is intended to act as an **additional command source**, rather than replacing the physical Nano controls.
-
-This prevents the touchscreen from becoming a single point of failure.
-
----
-
-# Hardware Communication
-
-## Nano ESP32 ↔ Mega 2560
-
-The Nano and Mega communicate using hardware UART.
-
-### UART Settings
-
-```text
-Baud Rate: 38400
-Data Bits: 8
-Parity:    None
-Stop Bits: 1
-```
-
-### Wiring
-
-| Nano ESP32 | Mega 2560 |
-| ---------- | --------- |
-| D10 TX     | D19 RX1   |
-| D11 RX     | D18 TX1   |
-| GND        | GND       |
-
-```text
-NANO ESP32                    MEGA 2560
-
-D10 TX  ------------------->  D19 RX1
-
-D11 RX  <-------------------  D18 TX1
-
-GND     --------------------  GND
-```
-
----
-
-# Nano ESP32 Inputs
-
-The Nano monitors 10 physical inputs.
-
-All inputs use:
-
-```cpp
 INPUT_PULLUP
-```
+
+Nano Input Pinout
+
+Input	Function	Nano Pin
+1	OUTERS	D2
+2	INTERMEDIATES	D3
+3	INNERS	D4
+4	TRAFFICBREAKERS	D5
+5	LEDS	D6
+6	TLEFT	D7
+7	TRIGHT	D8
+8	TOUT	D9
+9	LEFTSIGNAL	A0
+10	RIGHTSIGNAL	A1
+
+Input debounce time:
+
+50 ms
+
+⸻
+
+Nano UART Connections
+
+The Nano communicates with both the Mega and GIGA using separate hardware UART connections.
+
+Nano ↔ Mega UART
+
+Nano D10 TX ─────────► Mega D19 RX1
+Nano D11 RX ◄───────── Mega D18 TX1
+Nano GND ───────────── Mega GND
+
+UART configuration:
+
+Baud:      38,400
+Data:      8 bits
+Parity:    None
+Stop bits: 1
+
+Nano code:
+
+HardwareSerial MegaSerial(1);
+const int MEGA_RX_PIN = D11;
+const int MEGA_TX_PIN = D10;
+
+⸻
+
+Nano ↔ GIGA UART
+
+The GIGA communicates with the Nano through a second hardware UART.
+
+GIGA TX ─────────────► Nano D12 RX
+GIGA RX ◄───────────── Nano D13 TX
+GIGA GND ───────────── Nano GND
+
+UART configuration:
+
+Baud:      38,400
+Data:      8 bits
+Parity:    None
+Stop bits: 1
+
+Nano code:
+
+HardwareSerial GigaSerial(2);
+const int GIGA_RX_PIN = D12;
+const int GIGA_TX_PIN = D13;
+
+D12 / D13 Note
+
+D12 and D13 are reserved for GIGA communication in this project.
+
+On the Nano ESP32:
+
+D12 = GPIO47
+D13 = GPIO48
+
+These pins also have SPI functionality.
+
+D13/GPIO48 is also associated with the Nano’s built-in LED.
+
+Because this project is using D12 and D13 for the GIGA UART, SPI and the built-in LED should not be assigned to these pins while this UART configuration is in use.
+
+⸻
+
+Nano USB Serial
+
+The Nano USB serial monitor operates at:
+
+115,200 baud
+
+It is used for debugging communication, physical inputs, watchdog activity, and commands sent between controllers.
+
+Example output:
+
+INPUT 1 - OUTERS ACTIVE
+NANO -> MEGA: START OUTERS
+GIGA -> NANO: GIGA_PING
+GIGA communication established.
+GIGA -> NANO: START LEDS
+GIGA REQUEST ON: LEDS
+NANO -> MEGA: START LEDS
+
+⸻
+
+Command Protocol
+
+Commands between controllers use simple text messages terminated with a newline.
+
+START Command
+
+START <FUNCTION>
+
+Example:
+
+START OUTERS
+
+STOP Command
+
+STOP <FUNCTION>
+
+Example:
+
+STOP OUTERS
+
+Supported functions:
+
+OUTERS
+INTERMEDIATES
+INNERS
+TRAFFICBREAKERS
+LEDS
+TLEFT
+TRIGHT
+TOUT
+LEFTSIGNAL
+RIGHTSIGNAL
+
+The GIGA can request all 10 functions.
+
+⸻
+
+Source-Aware Command Arbitration
+
+The Nano keeps physical switch requests and GIGA requests separate.
+
+For example:
+
+OUTERS
+Physical Request = OFF
+GIGA Request     = ON
+Effective State = ON
+
+Likewise:
+
+OUTERS
+Physical Request = ON
+GIGA Request     = OFF
+Effective State = ON
+
+The effective state for normal functions is:
+
+Physical Request OR GIGA Request
 
 Therefore:
 
-```text
-HIGH = OFF
-LOW  = ACTIVE / GROUNDED
-```
+Physical	GIGA	Effective Output
+OFF	OFF	OFF
+ON	OFF	ON
+OFF	ON	ON
+ON	ON	ON
 
-## Input Pinout
+This prevents one control source from accidentally disabling another.
 
-| Input | Function        | Nano Pin |
-| ----: | --------------- | -------- |
-|     1 | OUTERS          | D2       |
-|     2 | INTERMEDIATES   | D3       |
-|     3 | INNERS          | D4       |
-|     4 | TRAFFICBREAKERS | D5       |
-|     5 | LEDS            | D6       |
-|     6 | TLEFT           | D7       |
-|     7 | TRIGHT          | D8       |
-|     8 | TOUT            | D9       |
-|     9 | LEFTSIGNAL      | A0       |
-|    10 | RIGHTSIGNAL     | A1       |
+⸻
 
----
+Nano → Mega Heartbeat
 
-# Input Debouncing
+The Nano sends:
 
-All 10 Nano inputs use software debouncing.
+PING
 
-Current debounce time:
+to the Mega every:
 
-```text
-50 ms
-```
+5 seconds
 
-When an input remains changed for at least 50 ms, the Nano accepts the new state and sends the appropriate command to the Mega.
+The Mega uses this heartbeat to determine whether communication with the Nano is still operating correctly.
 
----
+⸻
 
-# Mega Output Configuration
+Mega Watchdog
 
-All Mega lightbar outputs are **active LOW**.
+The Mega monitors the Nano heartbeat.
 
-```text
-LOW  = OUTPUT ON
-HIGH = OUTPUT OFF
-```
+Startup
 
-The Mega GPIO pins are intended to control appropriate external driver circuitry.
+Watchdog LED = OFF
 
-They should not directly drive high-current lightbar loads.
+After the first valid Nano PING:
 
----
+Watchdog LED = ON
 
-# Traffic Advisor Outputs
+Normal Communication
 
-The Traffic Advisor consists of eight individually controlled outputs.
+Less than 6 seconds since the last heartbeat:
 
-| Mega Pin | Output | Physical Position |
-| -------- | ------ | ----------------- |
-| D23      | TA1    | Far Left          |
-| D25      | TA2    |                   |
-| D27      | TA3    |                   |
-| D29      | TA4    |                   |
-| D31      | TA5    |                   |
-| D33      | TA6    |                   |
-| D35      | TA7    |                   |
-| D37      | TA8    | Far Right         |
+Watchdog LED = Solid ON
+Outputs = Enabled
 
-Physical arrangement:
+Communication Warning
 
-```text
-LEFT                                      RIGHT
+6–60 seconds since the last heartbeat:
 
-TA1   TA2   TA3   TA4   TA5   TA6   TA7   TA8
- │     │     │     │     │     │     │     │
-D23   D25   D27   D29   D31   D33   D35   D37
-```
+Watchdog LED = Flashing
+Outputs = Still Enabled
 
----
+Communication Failure
 
-# Direct Lightbar Outputs
+60 seconds or more since the last heartbeat:
 
-The remaining lightbar functions use direct outputs from the Mega.
+Watchdog LED = OFF
+All lightbar outputs = OFF
 
-| Mega Pin | Function        |
-| -------- | --------------- |
-| D39      | TRAFFICBREAKERS |
-| D41      | OUTERS          |
-| D43      | INTERMEDIATES   |
-| D45      | INNERS          |
-| D47      | LEDS            |
+When communication returns, a new valid PING reactivates the watchdog system.
 
-Currently unused:
+⸻
 
-```text
-D49
-D51
-D53
-```
+GIGA → Nano Heartbeat
 
-These pins are available for future expansion.
+The GIGA sends:
 
----
+GIGA_PING
 
-# Traffic Advisor Operation
+to the Nano.
 
-The Traffic Advisor currently supports three modes:
+The Nano records the most recent valid GIGA heartbeat.
 
-* `TLEFT`
-* `TRIGHT`
-* `TOUT`
+The Nano will not accept GIGA control commands until at least one valid:
 
-Only **one Traffic Advisor mode can be active at a time**.
+GIGA_PING
 
-If another TA command is activated while a pattern is running, the newest TA command takes priority.
+has been received.
 
-Each Traffic Advisor step lasts:
+⸻
 
-```text
-500 ms
-```
+GIGA Watchdog
 
-Exactly **two TA outputs are ON at any given time** while a pattern is active.
+The Nano has a separate watchdog specifically for GIGA communication.
 
----
+Timeout:
 
-## TLEFT
+60 seconds
 
-```text
+If the Nano does not receive another:
+
+GIGA_PING
+
+within 60 seconds, the GIGA is considered disconnected.
+
+The Nano then clears all requests originating from the GIGA.
+
+This includes:
+
+OUTERS
+INTERMEDIATES
+INNERS
+TRAFFICBREAKERS
+LEDS
+TLEFT
+TRIGHT
+TOUT
+LEFTSIGNAL
+RIGHTSIGNAL
+
+The watchdog does not clear physical Nano switch requests.
+
+⸻
+
+GIGA Watchdog Example
+
+Suppose the GIGA requests OUTERS:
+
+Physical OUTERS = OFF
+GIGA OUTERS     = ON
+Effective OUTERS = ON
+
+If GIGA communication fails:
+
+60 seconds without GIGA_PING
+             │
+             ▼
+GIGA OUTERS = OFF
+             │
+             ▼
+Physical OUTERS = OFF
+             │
+             ▼
+Nano sends:
+STOP OUTERS
+
+However, if the physical switch is also active:
+
+Physical OUTERS = ON
+GIGA OUTERS     = ON
+
+After a GIGA timeout:
+
+Physical OUTERS = ON
+GIGA OUTERS     = OFF
+Effective OUTERS = ON
+
+The Nano does not send STOP OUTERS.
+
+The physical switch retains control.
+
+⸻
+
+Turn Signal Watchdog Behavior
+
+Turn signals follow the same source-aware watchdog rules.
+
+The GIGA can send:
+
+START LEFTSIGNAL
+STOP LEFTSIGNAL
+START RIGHTSIGNAL
+STOP RIGHTSIGNAL
+
+If a turn signal was requested only by the GIGA and communication fails:
+
+GIGA LEFTSIGNAL = ON
+Physical LEFTSIGNAL = OFF
+        ↓
+60-second GIGA timeout
+        ↓
+GIGA LEFTSIGNAL = OFF
+        ↓
+Nano sends:
+STOP LEFTSIGNAL
+
+If the physical turn signal is also active:
+
+GIGA LEFTSIGNAL = ON
+Physical LEFTSIGNAL = ON
+        ↓
+60-second GIGA timeout
+        ↓
+GIGA LEFTSIGNAL = OFF
+Physical LEFTSIGNAL = ON
+        ↓
+LEFTSIGNAL remains active
+
+Therefore a GIGA failure cannot disable an active physical turn signal.
+
+⸻
+
+Traffic Advisor
+
+The Traffic Advisor consists of eight outputs.
+
+Mega Traffic Advisor Pinout
+
+Position	Function	Mega Pin
+1	TA1 — Far Left	D23
+2	TA2	D25
+3	TA3	D27
+4	TA4	D29
+5	TA5	D31
+6	TA6	D33
+7	TA7	D35
+8	TA8 — Far Right	D37
+
+Traffic Advisor commands:
+
+TLEFT
+TRIGHT
+TOUT
+
+Only one Traffic Advisor pattern can run at a time.
+
+The most recently activated Traffic Advisor request receives priority.
+
+⸻
+
+TLEFT Pattern
+
+Exactly two adjacent Traffic Advisor lights are active at a time.
+
 TA1 + TA2
 TA2 + TA3
 TA3 + TA4
@@ -360,14 +457,16 @@ TA4 + TA5
 TA5 + TA6
 TA6 + TA7
 TA7 + TA8
-REPEAT
-```
+Repeat
 
----
+Each step lasts:
 
-## TRIGHT
+500 ms
 
-```text
+⸻
+
+TRIGHT Pattern
+
 TA8 + TA7
 TA7 + TA6
 TA6 + TA5
@@ -375,519 +474,274 @@ TA5 + TA4
 TA4 + TA3
 TA3 + TA2
 TA2 + TA1
-REPEAT
-```
+Repeat
 
----
+Each step lasts:
 
-## TOUT
+500 ms
 
-```text
+⸻
+
+TOUT Pattern
+
 TA4 + TA5
 TA3 + TA6
 TA2 + TA7
 TA1 + TA8
-REPEAT
-```
+Repeat
 
----
+Each step lasts:
 
-# Turn Signal Integration
+500 ms
 
-The two outside Traffic Advisor outputs are also used for the turn signals.
+⸻
 
-```text
-TA1 = LEFTSIGNAL
-TA8 = RIGHTSIGNAL
-```
+Traffic Advisor Source Arbitration
 
-When no Traffic Advisor mode is active:
+The Nano tracks Traffic Advisor requests from both sources:
 
-```text
-LEFTSIGNAL  → TA1
-RIGHTSIGNAL → TA8
-```
+Physical switches
+GIGA touchscreen
 
-## Priority
-
-Traffic Advisor operation has priority over the turn signals.
-
-```text
-TRAFFIC ADVISOR ACTIVE
-          │
-          ▼
-TA CONTROLS TA1–TA8
-          │
-          ▼
-TURN SIGNALS CANNOT OVERRIDE TA
-```
-
-When the Traffic Advisor stops, any turn signal that is still active is automatically restored.
-
----
-
-# Command Protocol
-
-Communication between controllers uses simple text-based commands.
-
-## START
-
-Format:
-
-```text
-START <COMMAND>
-```
-
-Examples:
-
-```text
-START OUTERS
-START INTERMEDIATES
-START INNERS
-START TRAFFICBREAKERS
-START LEDS
-
-START TLEFT
-START TRIGHT
-START TOUT
-
-START LEFTSIGNAL
-START RIGHTSIGNAL
-```
-
----
-
-## STOP
-
-Format:
-
-```text
-STOP <COMMAND>
-```
-
-Examples:
-
-```text
-STOP OUTERS
-STOP INTERMEDIATES
-STOP INNERS
-STOP TRAFFICBREAKERS
-STOP LEDS
-
-STOP TLEFT
-STOP TRIGHT
-STOP TOUT
-
-STOP LEFTSIGNAL
-STOP RIGHTSIGNAL
-```
-
----
-
-## Heartbeat
-
-The Nano sends:
-
-```text
-PING
-```
-
-every:
-
-```text
-5 seconds
-```
-
-The Mega uses this heartbeat to verify that the Nano is still operating and communication remains available.
-
----
-
-# Communication Watchdog
-
-The Mega contains a communication watchdog.
-
-## Normal Operation
-
-After the first valid `PING`:
-
-```text
-Watchdog LED = SOLID ON
-Outputs       = ENABLED
-```
-
-## Warning
-
-If the Mega has not received a heartbeat for more than:
-
-```text
-6 seconds
-```
-
-the watchdog LED begins flashing.
-
-Outputs remain operational during the warning period.
-
-## Communication Failure
-
-If no heartbeat has been received for:
-
-```text
-60 seconds
-```
-
-the Mega:
-
-1. Turns all lightbar outputs OFF
-2. Turns the watchdog LED OFF
-3. Marks communication as lost
-4. Prevents normal lightbar operation until communication returns
-
-## Recovery
-
-When communication returns and a new `PING` is received:
-
-1. Communication is restored
-2. The watchdog LED turns solid ON
-3. Normal command processing resumes
-
----
-
-# Watchdog Summary
-
-| Condition              | Watchdog LED | Lightbar        |
-| ---------------------- | ------------ | --------------- |
-| Startup / no PING      | OFF          | Disabled        |
-| Normal communication   | Solid ON     | Enabled         |
-| 6–60 sec without PING  | Flashing     | Enabled         |
-| 60+ sec without PING   | OFF          | All outputs OFF |
-| Communication restored | Solid ON     | Enabled         |
-
----
-
-# Serial Debugging
-
-## Nano USB Serial
-
-```text
-115200 baud
-```
-
-The Nano reports:
-
-* Startup information
-* Pin configuration
-* Initial input states
-* Input activation/deactivation
-* Commands sent to Mega
-* Heartbeats
-* Messages received from Mega
+The most recently activated Traffic Advisor request wins.
 
 Example:
 
-```text
-INPUT 6 - TLEFT ACTIVE
-NANO -> MEGA: START TLEFT
-```
+Physical TLEFT = ON
+        ↓
+TLEFT running
+        ↓
+GIGA sends START TRIGHT
+        ↓
+TRIGHT becomes active
 
----
+If the GIGA then loses communication and its TRIGHT request is removed:
 
-## Mega USB Serial
+GIGA watchdog timeout
+        ↓
+GIGA TRIGHT request removed
+        ↓
+Physical TLEFT still active
+        ↓
+Nano sends:
+STOP TRIGHT
+START TLEFT
 
-```text
-115200 baud
-```
+The physical Traffic Advisor request automatically resumes.
 
-The Mega provides debugging information for:
+⸻
 
-* Startup
-* UART communication
-* Received commands
-* Traffic Advisor operation
-* Watchdog state
-* Communication failure
-* Communication recovery
+Turn Signal / Traffic Advisor Priority
 
----
+Physical turn signal inputs:
 
-# Complete Nano ESP32 Pin Reference
+A0 = LEFTSIGNAL
+A1 = RIGHTSIGNAL
 
-| Pin | Function              |
-| --- | --------------------- |
-| D2  | OUTERS input          |
-| D3  | INTERMEDIATES input   |
-| D4  | INNERS input          |
-| D5  | TRAFFICBREAKERS input |
-| D6  | LEDS input            |
-| D7  | TLEFT input           |
-| D8  | TRIGHT input          |
-| D9  | TOUT input            |
-| D10 | UART TX → Mega D19    |
-| D11 | UART RX ← Mega D18    |
-| A0  | LEFTSIGNAL input      |
-| A1  | RIGHTSIGNAL input     |
-| GND | Common ground         |
-
----
-
-# Complete Mega 2560 Pin Reference
-
-| Pin | Function        |
-| --- | --------------- |
-| D18 | TX1 → Nano D11  |
-| D19 | RX1 ← Nano D10  |
-| D23 | TA1             |
-| D25 | TA2             |
-| D27 | TA3             |
-| D29 | TA4             |
-| D31 | TA5             |
-| D33 | TA6             |
-| D35 | TA7             |
-| D37 | TA8             |
-| D39 | TRAFFICBREAKERS |
-| D41 | OUTERS          |
-| D43 | INTERMEDIATES   |
-| D45 | INNERS          |
-| D47 | LEDS            |
-| D49 | Unused          |
-| D51 | Unused          |
-| D53 | Unused          |
-| GND | Common ground   |
-
----
-
-# Electrical / Safety Notes
-
-## Nano ESP32 Inputs
-
-The Nano ESP32 uses **3.3 V GPIO logic**.
-
-**Do not connect a 12 V vehicle signal directly to a Nano GPIO pin.**
-
-Vehicle signals should pass through an appropriate interface, such as:
-
-* Optocoupler
-* Transistor interface
-* Appropriate level-shifting circuit
-* Other automotive-rated input-conditioning circuit
-
----
-
-## Mega Outputs
-
-The Mega GPIO pins are logic-level outputs.
-
-They should not directly power lightbar loads or switch high-current circuits.
-
-Use appropriately rated external output drivers, such as:
-
-* MOSFETs
-* Transistors
-* Driver ICs
-* Solid-state switching devices
-* Relays where appropriate
-
-Driver circuitry should be selected according to the actual electrical characteristics of the lightbar/control inputs.
-
----
-
-## Ground
-
-The Nano and Mega require a common ground for UART communication.
-
-```text
-Nano GND ───────── Mega GND
-```
-
-Proper automotive power regulation and protection should be used when powering the controllers from the truck's electrical system.
-
----
-
-# Project Status
-
-**Current Status: Functional Prototype**
-
-## Current Lightbar Controller
-
-* [x] Arduino Nano ESP32 input controller
-* [x] Arduino Mega 2560 output controller
-* [x] 10 Nano physical inputs
-* [x] Ground-triggered input operation
-* [x] 50 ms input debouncing
-* [x] Hardware UART communication
-* [x] 38400 baud Nano ↔ Mega communication
-* [x] Text-based START/STOP command protocol
-* [x] 5-second heartbeat
-* [x] Mega communication watchdog
-* [x] 6-second watchdog warning
-* [x] 60-second communication shutdown
-* [x] Automatic watchdog recovery
-* [x] 8-output Traffic Advisor
-* [x] TLEFT pattern
-* [x] TRIGHT pattern
-* [x] TOUT pattern
-* [x] Two-output TA sequencing
-* [x] 500 ms TA timing
-* [x] TA command priority
-* [x] Left turn signal integration
-* [x] Right turn signal integration
-* [x] Turn signal restoration after TA operation
-* [x] Five direct lightbar outputs
-* [x] Active-low Mega output control
-* [x] Nano serial debugging
-* [x] Mega serial debugging
-
----
-
-# Planned Arduino GIGA / Touchscreen Controller
-
-The project will eventually incorporate an **Arduino GIGA R1 WiFi with touchscreen** as an in-cab control and information system.
-
-## GIGA Hardware / Core System
-
-* [ ] Add Arduino GIGA R1 WiFi
-* [ ] Add touchscreen display
-* [ ] Design GIGA power supply and automotive protection
-* [ ] Establish communication between GIGA and lightbar control system
-* [ ] Define communication protocol for GIGA commands
-* [ ] Add GIGA communication heartbeat/watchdog
-* [ ] Add communication-loss handling
-* [ ] Ensure failure of GIGA does not disable Nano physical controls
-
-## Touchscreen Lightbar Controller
-
-* [ ] Develop main touchscreen user interface
-* [ ] Create dedicated lightbar control page
-* [ ] Add OUTERS touchscreen control
-* [ ] Add INTERMEDIATES touchscreen control
-* [ ] Add INNERS touchscreen control
-* [ ] Add TRAFFICBREAKERS touchscreen control
-* [ ] Add LEDS touchscreen control
-* [ ] Add TLEFT touchscreen control
-* [ ] Add TRIGHT touchscreen control
-* [ ] Add TOUT touchscreen control
-* [ ] Display current lightbar command states
-* [ ] Display active Traffic Advisor mode
-* [ ] Display communication status
-* [ ] Define priority between touchscreen and physical inputs
-* [ ] Allow touchscreen commands to coexist safely with physical controls
-* [ ] Add touchscreen startup/self-test page
-
----
-
-# Planned OBD-II / CAN Gauge System
-
-The GIGA touchscreen will also function as an OBD-II/CAN gauge and vehicle-information display for the truck.
-
-## OBD-II / CAN Hardware
-
-* [ ] Add suitable OBD-II/CAN interface
-* [ ] Establish communication with truck ECU
-* [ ] Identify supported standard OBD-II PIDs
-* [ ] Investigate truck-specific CAN messages
-* [ ] Isolate vehicle-data functionality from critical lightbar control
-
-## Gauge Interface
-
-* [ ] Create touchscreen gauge page
-* [ ] Display engine RPM
-* [ ] Display vehicle speed
-* [ ] Display engine coolant temperature
-* [ ] Display engine load
-* [ ] Display throttle position
-* [ ] Display intake air temperature
-* [ ] Display battery/control-module voltage where available
-* [ ] Add additional supported vehicle parameters
-* [ ] Create configurable gauge layouts
-* [ ] Add day/night gauge layouts
-* [ ] Add user-selectable gauges
-
-## Vehicle Warnings / Diagnostics
-
-* [ ] Add configurable warning thresholds
-* [ ] Add visual warning indicators
-* [ ] Add diagnostic trouble code display
-* [ ] Display active DTCs
-* [ ] Display pending DTCs
-* [ ] Add DTC descriptions
-* [ ] Add vehicle/CAN communication status display
-
----
-
-# Future Features
-
-Potential future expansion includes:
-
-* [ ] Automatic touchscreen brightness
-* [ ] Day/night display mode
-* [ ] User-configurable lightbar screen layout
-* [ ] User-configurable gauge layout
-* [ ] System diagnostics page
-* [ ] Nano communication status
-* [ ] Mega communication status
-* [ ] GIGA communication status
-* [ ] Output feedback/verification
-* [ ] Output-driver fault detection
-* [ ] ACK responses between controllers
-* [ ] Startup/self-test sequence
-* [ ] Store configuration in non-volatile memory
-* [ ] Vehicle data logging
-* [ ] Lightbar command/event logging
-* [ ] Diagnostic event logging
-* [ ] Additional Traffic Advisor patterns
-* [ ] Additional Mega outputs using D49/D51/D53
-* [ ] USB configuration
-* [ ] Wi-Fi configuration
-* [ ] Network-based software/configuration updates
-* [ ] Additional truck-specific CAN monitoring
-
----
-
-# Design Philosophy
-
-The project is being designed around **modular controllers with defined responsibilities**.
-
-### Nano ESP32
-
-```text
-PHYSICAL INPUTS
-      ↓
-INPUT PROCESSING
-      ↓
-COMMAND GENERATION
-```
-
-### Mega 2560
-
-```text
-COMMANDS
-    ↓
-OUTPUT LOGIC
-    ↓
-LIGHTBAR
-```
-
-### Arduino GIGA
-
-```text
-          TOUCHSCREEN
-              │
-       ┌──────┴──────┐
-       ▼             ▼
-LIGHTBAR UI       GAUGE UI
-       │             │
-       ▼             ▼
-CONTROL SYSTEM    OBD-II/CAN
-```
-
-A major design goal is to avoid making the touchscreen a single point of failure.
-
-The Nano's physical controls should remain capable of controlling the lightbar independently of the GIGA touchscreen.
-
----
-
-# Recommended Repository Structure
-
-```text
+When no Traffic Advisor pattern is active:
+
+LEFTSIGNAL  → TA1 ON
+RIGHTSIGNAL → TA8 ON
+
+Traffic Advisor patterns have priority over the turn-signal display.
+
+If a Traffic Advisor pattern starts while a turn signal is active, the Traffic Advisor controls the TA outputs.
+
+When the Traffic Advisor stops, an active turn signal is restored.
+
+⸻
+
+Mega Direct Outputs
+
+Function	Mega Pin
+TRAFFICBREAKERS	D39
+OUTERS	D41
+INTERMEDIATES	D43
+INNERS	D45
+LEDS	D47
+
+Currently unused:
+
+D49
+D51
+D53
+
+⸻
+
+Mega Output Logic
+
+The Mega lightbar outputs are:
+
+ACTIVE LOW
+
+Meaning:
+
+OUTPUT_ON  = LOW;
+OUTPUT_OFF = HIGH;
+
+The Arduino GPIO pins should not directly carry lightbar power or high-current ground loads.
+
+Appropriate output drivers should be used.
+
+Example:
+
+Mega GPIO
+    │
+    ▼
+MOSFET / Transistor / Driver
+    │
+    ▼
+Lightbar Control Input
+
+⸻
+
+Electrical Safety
+
+Nano ESP32 Inputs
+
+The Nano ESP32 uses 3.3 V GPIO logic.
+
+Never apply vehicle 12 V directly to a Nano GPIO pin.
+
+For vehicle-derived 12 V signals, use an appropriate interface such as:
+
+Optocoupler
+Transistor interface
+Protected voltage-level interface
+Automotive-rated input circuit
+
+The exact interface should provide the Nano with a safe 3.3 V-compatible signal.
+
+⸻
+
+Common Ground
+
+For the UART connections:
+
+Nano GND
+Mega GND
+GIGA GND
+
+must share a common electrical reference unless an isolated communication interface is used.
+
+⸻
+
+Planned Arduino GIGA Controller
+
+Future hardware:
+
+Arduino GIGA R1 WiFi
+Arduino GIGA Display Shield
+
+The GIGA will provide:
+
+* Touchscreen lightbar controls
+* Vehicle diagnostic gauges
+* Communication with the Nano
+* GIGA heartbeat
+* Future user-interface features
+
+The GIGA will communicate with the Nano, not directly with the Mega.
+
+GIGA
+  │
+  │ UART
+  ▼
+NANO
+  │
+  │ UART
+  ▼
+MEGA
+
+⸻
+
+Planned GIGA Display
+
+The normal/default screen will be the diagnostic gauge screen.
+
+Two gauges are currently planned:
+
+IPR Duty Cycle
+0–100 %
+ICP Pressure
+0–4000 PSI
+
+Both gauges will have:
+
+* Analog-style needle
+* Scale markings
+* Digital value readout
+
+⸻
+
+Planned Screen Navigation
+
+There will be no permanent navigation button between the gauge and lightbar screens.
+
+Screen switching will use a two-finger gesture:
+
+Finger 1 starts on left side
+Finger 2 starts on right side
+Both swipe downward together
+
+Screen flow:
+
+GAUGE SCREEN
+     │
+     │ Two-finger downward swipe
+     ▼
+LIGHTBAR SCREEN
+     │
+     │ Two-finger downward swipe
+     ▼
+GAUGE SCREEN
+
+⸻
+
+Planned GIGA Lightbar Controls
+
+The touchscreen lightbar screen is planned to control:
+
+OUTERS
+INTERMEDIATES
+INNERS
+TRAFFICBREAKERS
+LEDS
+TLEFT
+TRIGHT
+TOUT
+
+The communication protocol also supports:
+
+LEFTSIGNAL
+RIGHTSIGNAL
+
+if turn-signal touchscreen controls are added.
+
+⸻
+
+Planned Vehicle Diagnostics
+
+Target vehicle:
+
+1996 Ford F-350
+7.3L Power Stroke Diesel
+
+The two planned diagnostic values are:
+
+IPR Duty Cycle
+ICP Pressure
+
+The truck uses Ford-era SAE J1850 PWM/SCP diagnostic communication rather than modern CAN-based OBD communication.
+
+The final diagnostic interface will require an appropriate J1850 PWM-compatible vehicle interface/transceiver.
+
+⸻
+
+Repository Structure
+
+Recommended repository structure:
+
 Lightbar-Controller/
 │
 ├── README.md
@@ -908,21 +762,121 @@ Lightbar-Controller/
 │   ├── Protocol.md
 │   ├── TrafficAdvisor.md
 │   ├── Watchdog.md
-│   └── OBD2_CAN.md
+│   └── VehicleDiagnostics.md
 │
 └── Hardware/
     ├── Input_Interface/
     ├── Output_Drivers/
     ├── GIGA/
     └── Schematics/
-```
 
----
+⸻
 
-# Development Status
+Project Checklist
 
-This project is under active development.
+Nano ESP32
 
-The **Nano ESP32 and Mega 2560 lightbar control system is currently functional**, while the **Arduino GIGA touchscreen and OBD-II/CAN system are planned future additions**.
+* [x]	Configure 10 ground-triggered physical inputs
+* [x]	Add 50 ms input debounce
+* [x]	Configure Nano → Mega UART
+* [x]	Send START / STOP commands to Mega
+* [x]	Send 5-second heartbeat to Mega
+* [x]	Add separate GIGA UART
+* [x]	Reserve D12/D13 for GIGA communication
+* [x]	Add GIGA_PING heartbeat monitoring
+* [x]	Add 60-second GIGA watchdog
+* [x]	Separate physical and GIGA command requests
+* [x]	Prevent GIGA timeout from disabling physical requests
+* [x]	Include GIGA-controlled turn signals in watchdog
+* [x]	Add Traffic Advisor source arbitration
+* [ ]	Hardware-test Nano ↔ GIGA UART
+* [ ]	Hardware-test GIGA watchdog
+* [ ]	Hardware-test simultaneous physical/GIGA requests
+* [ ]	Hardware-test Traffic Advisor source restoration
 
-Pin assignments, communication protocols, hardware interfaces, and planned features may change as development continues.
+Mega 2560
+
+* [x]	Configure lightbar outputs
+* [x]	Configure Traffic Advisor outputs
+* [x]	Implement TLEFT
+* [x]	Implement TRIGHT
+* [x]	Implement TOUT
+* [x]	Add turn-signal priority handling
+* [x]	Add Nano heartbeat watchdog
+* [x]	Add communication-loss shutdown
+* [ ]	Final vehicle hardware testing
+
+Arduino GIGA
+
+* [ ]	Obtain Arduino GIGA R1 WiFi
+* [ ]	Obtain GIGA Display Shield
+* [ ]	Configure landscape display
+* [ ]	Configure LVGL
+* [ ]	Configure GIGA → Nano UART
+* [ ]	Implement GIGA_PING
+* [ ]	Send GIGA heartbeat periodically
+* [ ]	Implement START / STOP command protocol
+* [ ]	Build lightbar touchscreen
+* [ ]	Build IPR gauge
+* [ ]	Build ICP gauge
+* [ ]	Implement two-finger screen-change gesture
+* [ ]	Add communication status indication
+* [ ]	Test GIGA disconnect/reconnect behavior
+
+Vehicle Diagnostics
+
+* [ ]	Verify diagnostic connector pin population
+* [ ]	Verify J1850 PWM communication
+* [ ]	Verify IPR live-data request
+* [ ]	Verify ICP live-data request
+* [ ]	Select J1850 PWM interface/transceiver
+* [ ]	Implement diagnostic communication on GIGA
+* [ ]	Validate IPR percentage
+* [ ]	Validate ICP PSI
+* [ ]	Add stale-data detection
+* [ ]	Add diagnostic communication failure indication
+
+Hardware
+
+* [ ]	Design protected 12 V → 3.3 V Nano input interface
+* [ ]	Design Mega output driver circuits
+* [ ]	Add appropriate fusing
+* [ ]	Add reverse-polarity protection
+* [ ]	Add automotive transient protection
+* [ ]	Build final wiring harness
+* [ ]	Label Nano/Mega/GIGA UART wiring
+* [ ]	Create final wiring schematic
+* [ ]	Bench-test complete system
+* [ ]	Install in vehicle
+
+⸻
+
+Current Project Status
+
+The Nano/Mega lightbar controller is currently a functional prototype.
+
+The latest Nano architecture adds:
+
+Physical control inputs
+        +
+GIGA touchscreen requests
+        ↓
+Source-aware arbitration
+        ↓
+Final command to Mega
+
+Two independent communication watchdog layers are planned/currently implemented:
+
+GIGA
+ │
+ │ GIGA_PING
+ ▼
+NANO
+ │
+ │ PING
+ ▼
+MEGA
+
+This provides protection against either the GIGA or Nano disappearing while preserving physical control whenever possible.
+
+The Arduino GIGA touchscreen and vehicle diagnostic system are the next major development stages.
