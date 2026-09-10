@@ -1,0 +1,1170 @@
+// ============================================================
+// LIGHTBAR CONTROLLER - ARDUINO MEGA
+// ============================================================
+//
+// NANO ESP32 -> MEGA
+//
+// UART:
+// Mega RX1 = Pin 19
+// Mega TX1 = Pin 18
+// Baud     = 38400
+//
+// USB SERIAL MONITOR:
+// 115200 baud
+//
+// OUTPUTS ARE ACTIVE LOW:
+//
+// LOW  = OUTPUT ON / GROUND TRIGGER
+// HIGH = OUTPUT OFF
+//
+// WATCHDOG:
+// Startup       = LED OFF
+// First PING    = LED solid ON
+// 0-6 sec       = LED solid ON
+// 6-60 sec      = LED flashing
+// 60+ sec       = LED OFF + all outputs OFF
+//
+// ============================================================
+
+
+// ============================================================
+// SERIAL SETTINGS
+// ============================================================
+
+const unsigned long MEGA_BAUD = 38400;
+const unsigned long USB_BAUD  = 115200;
+
+
+// ============================================================
+// ACTIVE-LOW OUTPUT SETTINGS
+// ============================================================
+
+const byte OUTPUT_ON  = LOW;
+const byte OUTPUT_OFF = HIGH;
+
+
+// ============================================================
+// WATCHDOG SETTINGS
+// ============================================================
+
+const unsigned long WATCHDOG_WARNING_TIME = 6000;
+const unsigned long WATCHDOG_TIMEOUT      = 60000;
+const unsigned long WATCHDOG_FLASH_TIME   = 500;
+
+
+// ============================================================
+// WATCHDOG VARIABLES
+// ============================================================
+
+unsigned long lastNanoPing = 0;
+unsigned long lastWatchdogFlash = 0;
+
+bool watchdogStarted = false;
+bool communicationLost = false;
+bool watchdogLedState = false;
+
+
+// ============================================================
+// BOARD LED
+// ============================================================
+
+const byte WATCHDOG_LED = LED_BUILTIN;
+
+
+// ============================================================
+// TRAFFIC ADVISOR OUTPUTS
+// ============================================================
+//
+// TA1 = far left
+// TA8 = far right
+//
+// D23 = TA1
+// D25 = TA2
+// D27 = TA3
+// D29 = TA4
+// D31 = TA5
+// D33 = TA6
+// D35 = TA7
+// D37 = TA8
+//
+// ============================================================
+
+const byte TA_COUNT = 8;
+
+const byte trafficAdvisorPins[TA_COUNT] = {
+
+  23,  // TA1 - Far Left
+  25,  // TA2
+  27,  // TA3
+  29,  // TA4
+  31,  // TA5
+  33,  // TA6
+  35,  // TA7
+  37   // TA8 - Far Right
+
+};
+
+
+// ============================================================
+// TRAFFIC ADVISOR TIMING
+// ============================================================
+
+const unsigned long TA_STEP_TIME = 500;
+
+unsigned long lastTAStep = 0;
+
+
+// ============================================================
+// TRAFFIC ADVISOR MODES
+// ============================================================
+
+enum TAMode {
+
+  TA_OFF,
+  TA_LEFT,
+  TA_RIGHT,
+  TA_OUT
+
+};
+
+TAMode currentTAMode = TA_OFF;
+
+byte currentTAStep = 0;
+
+
+// ============================================================
+// TURN SIGNAL STATES
+// ============================================================
+
+bool leftSignalActive = false;
+bool rightSignalActive = false;
+
+
+// ============================================================
+// DIRECT OUTPUTS
+// ============================================================
+//
+// D39 = TRAFFICBREAKERS
+// D41 = OUTERS
+// D43 = INTERMEDIATES
+// D45 = INNERS
+// D47 = LEDS
+//
+// D49, D51, D53 currently unused.
+//
+// ============================================================
+
+const byte TRAFFICBREAKERS_PIN = 39;
+const byte OUTERS_PIN          = 41;
+const byte INTERMEDIATES_PIN   = 43;
+const byte INNERS_PIN          = 45;
+const byte LEDS_PIN            = 47;
+
+
+// ============================================================
+// COMMAND NAMES
+// ============================================================
+
+const byte NUM_COMMANDS = 10;
+
+const char* commandNames[NUM_COMMANDS] = {
+
+  "OUTERS",
+  "INTERMEDIATES",
+  "INNERS",
+  "TRAFFICBREAKERS",
+  "LEDS",
+  "TLEFT",
+  "TRIGHT",
+  "TOUT",
+  "LEFTSIGNAL",
+  "RIGHTSIGNAL"
+
+};
+
+
+// ============================================================
+// COMMAND STATES
+// ============================================================
+
+bool commandRunning[NUM_COMMANDS];
+
+
+// ============================================================
+// SERIAL RECEIVE BUFFER
+// ============================================================
+
+String incomingCommand = "";
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(USB_BAUD);
+
+  delay(500);
+
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println(" LIGHTBAR MEGA CONTROLLER");
+  Serial.println("=================================");
+  Serial.println();
+
+  Serial.println("OUTPUT MODE: ACTIVE LOW");
+  Serial.println("LOW  = ON / GROUND TRIGGER");
+  Serial.println("HIGH = OFF");
+  Serial.println();
+
+
+  // ----------------------------------------------------------
+  // NANO UART
+  // ----------------------------------------------------------
+
+  Serial1.begin(MEGA_BAUD);
+
+  Serial.println("Serial1 started.");
+  Serial.println("RX1 = Pin 19");
+  Serial.println("TX1 = Pin 18");
+
+  Serial.print("UART baud = ");
+  Serial.println(MEGA_BAUD);
+
+  Serial.println();
+
+
+  // ----------------------------------------------------------
+  // WATCHDOG LED
+  // ----------------------------------------------------------
+
+  pinMode(WATCHDOG_LED, OUTPUT);
+
+  digitalWrite(WATCHDOG_LED, LOW);
+
+
+  // ----------------------------------------------------------
+  // TRAFFIC ADVISOR
+  // ----------------------------------------------------------
+
+  Serial.println("Configuring traffic advisor...");
+
+  for (byte i = 0; i < TA_COUNT; i++) {
+
+    pinMode(trafficAdvisorPins[i], OUTPUT);
+
+    digitalWrite(trafficAdvisorPins[i], OUTPUT_OFF);
+
+  }
+
+
+  // ----------------------------------------------------------
+  // DIRECT OUTPUTS
+  // ----------------------------------------------------------
+
+  Serial.println("Configuring direct outputs...");
+
+  pinMode(TRAFFICBREAKERS_PIN, OUTPUT);
+  pinMode(OUTERS_PIN, OUTPUT);
+  pinMode(INTERMEDIATES_PIN, OUTPUT);
+  pinMode(INNERS_PIN, OUTPUT);
+  pinMode(LEDS_PIN, OUTPUT);
+
+  digitalWrite(TRAFFICBREAKERS_PIN, OUTPUT_OFF);
+  digitalWrite(OUTERS_PIN, OUTPUT_OFF);
+  digitalWrite(INTERMEDIATES_PIN, OUTPUT_OFF);
+  digitalWrite(INNERS_PIN, OUTPUT_OFF);
+  digitalWrite(LEDS_PIN, OUTPUT_OFF);
+
+
+  // ----------------------------------------------------------
+  // CLEAR COMMAND STATES
+  // ----------------------------------------------------------
+
+  for (byte i = 0; i < NUM_COMMANDS; i++) {
+
+    commandRunning[i] = false;
+
+  }
+
+
+  leftSignalActive = false;
+  rightSignalActive = false;
+
+
+  // ----------------------------------------------------------
+  // WATCHDOG STARTUP STATE
+  // ----------------------------------------------------------
+
+  watchdogStarted = false;
+  communicationLost = false;
+  watchdogLedState = false;
+
+  lastNanoPing = 0;
+  lastWatchdogFlash = millis();
+
+  digitalWrite(WATCHDOG_LED, LOW);
+
+
+  Serial.println();
+  Serial.println("Traffic advisor ready.");
+  Serial.println("Turn signals ready.");
+  Serial.println("Direct outputs ready.");
+  Serial.println("Watchdog ready.");
+  Serial.println();
+  Serial.println("WAITING FOR FIRST NANO HEARTBEAT...");
+  Serial.println("LED will remain OFF until PING is received.");
+  Serial.println();
+
+}
+
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+
+  while (Serial1.available()) {
+
+    char receivedCharacter = Serial1.read();
+
+    if (receivedCharacter == '\n') {
+
+      incomingCommand.trim();
+
+      if (incomingCommand.length() > 0) {
+
+        processCommand(incomingCommand);
+
+      }
+
+      incomingCommand = "";
+
+    }
+
+    else {
+
+      incomingCommand += receivedCharacter;
+
+    }
+
+  }
+
+
+  updateTrafficAdvisor();
+
+  updateWatchdog();
+
+}
+
+
+// ============================================================
+// PROCESS COMMAND
+// ============================================================
+
+void processCommand(String command) {
+
+  // ==========================================================
+  // PING
+  // ==========================================================
+
+  if (command == "PING") {
+
+    lastNanoPing = millis();
+
+    if (!watchdogStarted) {
+
+      watchdogStarted = true;
+      communicationLost = false;
+      watchdogLedState = true;
+
+      digitalWrite(WATCHDOG_LED, HIGH);
+
+      Serial.println();
+      Serial.println("=================================");
+      Serial.println(" FIRST NANO HEARTBEAT RECEIVED");
+      Serial.println(" WATCHDOG ACTIVE");
+      Serial.println("=================================");
+      Serial.println();
+
+    }
+
+    else if (communicationLost) {
+
+      communicationLost = false;
+      watchdogLedState = true;
+
+      digitalWrite(WATCHDOG_LED, HIGH);
+
+      Serial.println();
+      Serial.println("=================================");
+      Serial.println(" COMMUNICATION RESTORED");
+      Serial.println(" WATCHDOG ACTIVE");
+      Serial.println("=================================");
+      Serial.println();
+
+    }
+
+    Serial.println("NANO -> MEGA: PING");
+
+    return;
+
+  }
+
+
+  // ==========================================================
+  // IGNORE COMMANDS BEFORE FIRST HEARTBEAT
+  // ==========================================================
+
+  if (!watchdogStarted) {
+
+    Serial.print("IGNORING COMMAND - WAITING FOR FIRST PING: ");
+    Serial.println(command);
+
+    return;
+
+  }
+
+
+  Serial.print("NANO -> MEGA: ");
+  Serial.println(command);
+
+
+  // ==========================================================
+  // START COMMAND
+  // ==========================================================
+
+  if (command.startsWith("START ")) {
+
+    String name = command.substring(6);
+    name.trim();
+
+    startCommand(name);
+
+    return;
+
+  }
+
+
+  // ==========================================================
+  // STOP COMMAND
+  // ==========================================================
+
+  if (command.startsWith("STOP ")) {
+
+    String name = command.substring(5);
+    name.trim();
+
+    stopCommand(name);
+
+    return;
+
+  }
+
+
+  Serial.print("UNKNOWN COMMAND: ");
+  Serial.println(command);
+
+}
+
+
+// ============================================================
+// WATCHDOG
+// ============================================================
+
+void updateWatchdog() {
+
+  if (!watchdogStarted) {
+
+    digitalWrite(WATCHDOG_LED, LOW);
+
+    return;
+
+  }
+
+
+  unsigned long now = millis();
+
+  unsigned long timeSincePing = now - lastNanoPing;
+
+
+  // ==========================================================
+  // HEALTHY
+  // ==========================================================
+
+  if (timeSincePing < WATCHDOG_WARNING_TIME) {
+
+    communicationLost = false;
+    watchdogLedState = true;
+
+    digitalWrite(WATCHDOG_LED, HIGH);
+
+    return;
+
+  }
+
+
+  // ==========================================================
+  // WARNING - FLASHING
+  // ==========================================================
+
+  if (timeSincePing < WATCHDOG_TIMEOUT) {
+
+    communicationLost = false;
+
+    if (now - lastWatchdogFlash >= WATCHDOG_FLASH_TIME) {
+
+      lastWatchdogFlash = now;
+
+      watchdogLedState = !watchdogLedState;
+
+      digitalWrite(WATCHDOG_LED, watchdogLedState);
+
+    }
+
+    return;
+
+  }
+
+
+  // ==========================================================
+  // COMMUNICATION LOST
+  // ==========================================================
+
+  if (!communicationLost) {
+
+    communicationLost = true;
+
+    Serial.println();
+    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    Serial.println(" COMMUNICATION LOST");
+    Serial.println(" NANO HEARTBEAT TIMEOUT");
+    Serial.println(" ALL OUTPUTS OFF");
+    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    Serial.println();
+
+    watchdogLedState = false;
+
+    digitalWrite(WATCHDOG_LED, LOW);
+
+    stopAllOutputs();
+
+  }
+
+}
+
+
+// ============================================================
+// START COMMAND
+// ============================================================
+
+void startCommand(String name) {
+
+  // TLEFT
+
+  if (name == "TLEFT") {
+
+    startTrafficAdvisor(TA_LEFT);
+
+    return;
+
+  }
+
+
+  // TRIGHT
+
+  if (name == "TRIGHT") {
+
+    startTrafficAdvisor(TA_RIGHT);
+
+    return;
+
+  }
+
+
+  // TOUT
+
+  if (name == "TOUT") {
+
+    startTrafficAdvisor(TA_OUT);
+
+    return;
+
+  }
+
+
+  // LEFT SIGNAL
+
+  if (name == "LEFTSIGNAL") {
+
+    leftSignalActive = true;
+    commandRunning[8] = true;
+
+    Serial.println("LEFT SIGNAL: ON");
+
+    if (currentTAMode == TA_OFF) {
+
+      updateSignalOutputs();
+
+    }
+
+    return;
+
+  }
+
+
+  // RIGHT SIGNAL
+
+  if (name == "RIGHTSIGNAL") {
+
+    rightSignalActive = true;
+    commandRunning[9] = true;
+
+    Serial.println("RIGHT SIGNAL: ON");
+
+    if (currentTAMode == TA_OFF) {
+
+      updateSignalOutputs();
+
+    }
+
+    return;
+
+  }
+
+
+  // TRAFFICBREAKERS
+
+  if (name == "TRAFFICBREAKERS") {
+
+    commandRunning[3] = true;
+
+    digitalWrite(TRAFFICBREAKERS_PIN, OUTPUT_ON);
+
+    Serial.println("TRAFFICBREAKERS: ON");
+
+    return;
+
+  }
+
+
+  // OUTERS
+
+  if (name == "OUTERS") {
+
+    commandRunning[0] = true;
+
+    digitalWrite(OUTERS_PIN, OUTPUT_ON);
+
+    Serial.println("OUTERS: ON");
+
+    return;
+
+  }
+
+
+  // INTERMEDIATES
+
+  if (name == "INTERMEDIATES") {
+
+    commandRunning[1] = true;
+
+    digitalWrite(INTERMEDIATES_PIN, OUTPUT_ON);
+
+    Serial.println("INTERMEDIATES: ON");
+
+    return;
+
+  }
+
+
+  // INNERS
+
+  if (name == "INNERS") {
+
+    commandRunning[2] = true;
+
+    digitalWrite(INNERS_PIN, OUTPUT_ON);
+
+    Serial.println("INNERS: ON");
+
+    return;
+
+  }
+
+
+  // LEDS
+
+  if (name == "LEDS") {
+
+    commandRunning[4] = true;
+
+    digitalWrite(LEDS_PIN, OUTPUT_ON);
+
+    Serial.println("LEDS: ON");
+
+    return;
+
+  }
+
+
+  Serial.print("UNKNOWN START COMMAND: ");
+  Serial.println(name);
+
+}
+
+
+// ============================================================
+// STOP COMMAND
+// ============================================================
+
+void stopCommand(String name) {
+
+  // TRAFFIC ADVISOR
+
+  if (name == "TLEFT" ||
+      name == "TRIGHT" ||
+      name == "TOUT") {
+
+    stopTrafficAdvisor();
+
+    return;
+
+  }
+
+
+  // LEFT SIGNAL
+
+  if (name == "LEFTSIGNAL") {
+
+    leftSignalActive = false;
+    commandRunning[8] = false;
+
+    Serial.println("LEFT SIGNAL: OFF");
+
+    if (currentTAMode == TA_OFF) {
+
+      updateSignalOutputs();
+
+    }
+
+    return;
+
+  }
+
+
+  // RIGHT SIGNAL
+
+  if (name == "RIGHTSIGNAL") {
+
+    rightSignalActive = false;
+    commandRunning[9] = false;
+
+    Serial.println("RIGHT SIGNAL: OFF");
+
+    if (currentTAMode == TA_OFF) {
+
+      updateSignalOutputs();
+
+    }
+
+    return;
+
+  }
+
+
+  // TRAFFICBREAKERS
+
+  if (name == "TRAFFICBREAKERS") {
+
+    commandRunning[3] = false;
+
+    digitalWrite(TRAFFICBREAKERS_PIN, OUTPUT_OFF);
+
+    Serial.println("TRAFFICBREAKERS: OFF");
+
+    return;
+
+  }
+
+
+  // OUTERS
+
+  if (name == "OUTERS") {
+
+    commandRunning[0] = false;
+
+    digitalWrite(OUTERS_PIN, OUTPUT_OFF);
+
+    Serial.println("OUTERS: OFF");
+
+    return;
+
+  }
+
+
+  // INTERMEDIATES
+
+  if (name == "INTERMEDIATES") {
+
+    commandRunning[1] = false;
+
+    digitalWrite(INTERMEDIATES_PIN, OUTPUT_OFF);
+
+    Serial.println("INTERMEDIATES: OFF");
+
+    return;
+
+  }
+
+
+  // INNERS
+
+  if (name == "INNERS") {
+
+    commandRunning[2] = false;
+
+    digitalWrite(INNERS_PIN, OUTPUT_OFF);
+
+    Serial.println("INNERS: OFF");
+
+    return;
+
+  }
+
+
+  // LEDS
+
+  if (name == "LEDS") {
+
+    commandRunning[4] = false;
+
+    digitalWrite(LEDS_PIN, OUTPUT_OFF);
+
+    Serial.println("LEDS: OFF");
+
+    return;
+
+  }
+
+
+  Serial.print("UNKNOWN STOP COMMAND: ");
+  Serial.println(name);
+
+}
+
+
+// ============================================================
+// START TRAFFIC ADVISOR
+// ============================================================
+
+void startTrafficAdvisor(TAMode newMode) {
+
+  // Most recently activated TA gets priority.
+
+  turnOffTrafficAdvisor();
+
+  currentTAMode = newMode;
+  currentTAStep = 0;
+
+  lastTAStep = millis() - TA_STEP_TIME;
+
+
+  Serial.print("TRAFFIC ADVISOR ACTIVE: ");
+
+  if (newMode == TA_LEFT) {
+
+    Serial.println("TLEFT");
+
+  }
+
+  else if (newMode == TA_RIGHT) {
+
+    Serial.println("TRIGHT");
+
+  }
+
+  else if (newMode == TA_OUT) {
+
+    Serial.println("TOUT");
+
+  }
+
+
+  updateTrafficAdvisor();
+
+}
+
+
+// ============================================================
+// STOP TRAFFIC ADVISOR
+// ============================================================
+
+void stopTrafficAdvisor() {
+
+  currentTAMode = TA_OFF;
+  currentTAStep = 0;
+
+  turnOffTrafficAdvisor();
+
+  updateSignalOutputs();
+
+  Serial.println("TRAFFIC ADVISOR: OFF");
+
+}
+
+
+// ============================================================
+// UPDATE TRAFFIC ADVISOR
+// ============================================================
+
+void updateTrafficAdvisor() {
+
+  if (currentTAMode == TA_OFF) {
+
+    return;
+
+  }
+
+
+  unsigned long now = millis();
+
+
+  if (now - lastTAStep >= TA_STEP_TIME) {
+
+    lastTAStep = now;
+
+    // Turn off previous pair
+
+    turnOffTrafficAdvisor();
+
+
+    // Set current pair
+
+    if (currentTAMode == TA_LEFT) {
+
+      setLeftPair(currentTAStep);
+
+    }
+
+    else if (currentTAMode == TA_RIGHT) {
+
+      setRightPair(currentTAStep);
+
+    }
+
+    else if (currentTAMode == TA_OUT) {
+
+      setOutPair(currentTAStep);
+
+    }
+
+
+    // Advance step
+
+    currentTAStep++;
+
+
+    if (currentTAMode == TA_LEFT ||
+        currentTAMode == TA_RIGHT) {
+
+      if (currentTAStep >= 7) {
+
+        currentTAStep = 0;
+
+      }
+
+    }
+
+
+    if (currentTAMode == TA_OUT) {
+
+      if (currentTAStep >= 4) {
+
+        currentTAStep = 0;
+
+      }
+
+    }
+
+  }
+
+}
+
+
+// ============================================================
+// TLEFT PAIRS
+// ============================================================
+
+void setLeftPair(byte step) {
+
+  byte first = step;
+  byte second = step + 1;
+
+  digitalWrite(trafficAdvisorPins[first], OUTPUT_ON);
+  digitalWrite(trafficAdvisorPins[second], OUTPUT_ON);
+
+}
+
+
+// ============================================================
+// TRIGHT PAIRS
+// ============================================================
+
+void setRightPair(byte step) {
+
+  byte first = 7 - step;
+  byte second = 6 - step;
+
+  digitalWrite(trafficAdvisorPins[first], OUTPUT_ON);
+  digitalWrite(trafficAdvisorPins[second], OUTPUT_ON);
+
+}
+
+
+// ============================================================
+// TOUT PAIRS
+// ============================================================
+
+void setOutPair(byte step) {
+
+  if (step == 0) {
+
+    digitalWrite(trafficAdvisorPins[3], OUTPUT_ON);
+    digitalWrite(trafficAdvisorPins[4], OUTPUT_ON);
+
+  }
+
+  else if (step == 1) {
+
+    digitalWrite(trafficAdvisorPins[2], OUTPUT_ON);
+    digitalWrite(trafficAdvisorPins[5], OUTPUT_ON);
+
+  }
+
+  else if (step == 2) {
+
+    digitalWrite(trafficAdvisorPins[1], OUTPUT_ON);
+    digitalWrite(trafficAdvisorPins[6], OUTPUT_ON);
+
+  }
+
+  else if (step == 3) {
+
+    digitalWrite(trafficAdvisorPins[0], OUTPUT_ON);
+    digitalWrite(trafficAdvisorPins[7], OUTPUT_ON);
+
+  }
+
+}
+
+
+// ============================================================
+// TURN OFF TRAFFIC ADVISOR
+// ============================================================
+
+void turnOffTrafficAdvisor() {
+
+  for (byte i = 0; i < TA_COUNT; i++) {
+
+    digitalWrite(trafficAdvisorPins[i], OUTPUT_OFF);
+
+  }
+
+}
+
+
+// ============================================================
+// TURN SIGNAL OUTPUTS
+// ============================================================
+
+void updateSignalOutputs() {
+
+  // Traffic Advisor has priority.
+
+  if (currentTAMode != TA_OFF) {
+
+    return;
+
+  }
+
+
+  // LEFT SIGNAL = TA1
+
+  if (leftSignalActive) {
+
+    digitalWrite(trafficAdvisorPins[0], OUTPUT_ON);
+
+  }
+
+  else {
+
+    digitalWrite(trafficAdvisorPins[0], OUTPUT_OFF);
+
+  }
+
+
+  // RIGHT SIGNAL = TA8
+
+  if (rightSignalActive) {
+
+    digitalWrite(trafficAdvisorPins[7], OUTPUT_ON);
+
+  }
+
+  else {
+
+    digitalWrite(trafficAdvisorPins[7], OUTPUT_OFF);
+
+  }
+
+
+  // TA2-TA7 OFF
+
+  for (byte i = 1; i < 7; i++) {
+
+    digitalWrite(trafficAdvisorPins[i], OUTPUT_OFF);
+
+  }
+
+}
+
+
+// ============================================================
+// STOP ALL OUTPUTS
+// ============================================================
+
+void stopAllOutputs() {
+
+  currentTAMode = TA_OFF;
+  currentTAStep = 0;
+
+  turnOffTrafficAdvisor();
+
+
+  // Direct outputs OFF
+
+  digitalWrite(TRAFFICBREAKERS_PIN, OUTPUT_OFF);
+  digitalWrite(OUTERS_PIN, OUTPUT_OFF);
+  digitalWrite(INTERMEDIATES_PIN, OUTPUT_OFF);
+  digitalWrite(INNERS_PIN, OUTPUT_OFF);
+  digitalWrite(LEDS_PIN, OUTPUT_OFF);
+
+
+  // Clear command states
+
+  for (byte i = 0; i < NUM_COMMANDS; i++) {
+
+    commandRunning[i] = false;
+
+  }
+
+
+  // Clear signals
+
+  leftSignalActive = false;
+  rightSignalActive = false;
+
+}
