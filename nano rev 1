@@ -1,0 +1,456 @@
+// ============================================================
+// LIGHTBAR CONTROLLER - ARDUINO NANO ESP32
+// ============================================================
+//
+// 10 ground-triggered inputs
+//
+// HIGH = input OFF
+// LOW  = input ON / grounded
+//
+// UART TO MEGA:
+// D10 = TX
+// D11 = RX
+// 38,400 baud
+//
+// USB SERIAL MONITOR:
+// 115,200 baud
+//
+// HEARTBEAT:
+// PING every 5 seconds
+//
+// ============================================================
+
+
+// ============================================================
+// HARDWARE UART TO MEGA
+// ============================================================
+
+HardwareSerial MegaSerial(1);
+
+
+// ============================================================
+// UART PINS
+// ============================================================
+
+const int UART_RX_PIN = 11;
+const int UART_TX_PIN = 10;
+
+
+// ============================================================
+// UART BAUD RATE
+// ============================================================
+
+const unsigned long UART_BAUD = 38400;
+
+
+// ============================================================
+// USB SERIAL MONITOR BAUD RATE
+// ============================================================
+
+const unsigned long USB_BAUD = 115200;
+
+
+// ============================================================
+// INPUT COUNT
+// ============================================================
+
+const byte NUM_INPUTS = 10;
+
+
+// ============================================================
+// INPUT PINS
+// ============================================================
+//
+// Input 1  = D2
+// Input 2  = D3
+// Input 3  = D4
+// Input 4  = D5
+// Input 5  = D6
+// Input 6  = D7
+// Input 7  = D8
+// Input 8  = D9
+// Input 9  = A0
+// Input 10 = A1
+//
+// INPUT_PULLUP is used.
+//
+// HIGH = OFF
+// LOW  = ON / GROUNDED
+// ============================================================
+
+const byte inputPins[NUM_INPUTS] = {
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  A0,
+  A1
+};
+
+
+// ============================================================
+// INPUT NAMES
+// ============================================================
+
+const char* inputNames[NUM_INPUTS] = {
+
+  "OUTERS",
+  "INTERMEDIATES",
+  "INNERS",
+  "TRAFFICBREAKERS",
+  "LEDS",
+  "TLEFT",
+  "TRIGHT",
+  "TOUT",
+  "LEFTSIGNAL",
+  "RIGHTSIGNAL"
+
+};
+
+
+// ============================================================
+// INPUT STATE
+// ============================================================
+
+bool currentState[NUM_INPUTS];
+
+
+// ============================================================
+// DEBOUNCE
+// ============================================================
+
+unsigned long lastChangeTime[NUM_INPUTS];
+
+const unsigned long DEBOUNCE_TIME = 50;
+
+
+// ============================================================
+// HEARTBEAT
+// ============================================================
+
+unsigned long lastHeartbeat = 0;
+
+const unsigned long HEARTBEAT_INTERVAL = 5000;
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  // ----------------------------------------------------------
+  // Start USB Serial Monitor
+  // ----------------------------------------------------------
+
+  Serial.begin(USB_BAUD);
+
+  delay(500);
+
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println(" LIGHTBAR NANO ESP32");
+  Serial.println("=================================");
+  Serial.println();
+
+
+  // ----------------------------------------------------------
+  // Start UART to Mega
+  // ----------------------------------------------------------
+
+  MegaSerial.begin(
+    UART_BAUD,
+    SERIAL_8N1,
+    UART_RX_PIN,
+    UART_TX_PIN
+  );
+
+
+  Serial.println("Mega UART started.");
+  Serial.print("TX pin: D");
+  Serial.println(UART_TX_PIN);
+
+  Serial.print("RX pin: D");
+  Serial.println(UART_RX_PIN);
+
+  Serial.print("UART baud: ");
+  Serial.println(UART_BAUD);
+
+  Serial.println();
+
+
+  // ----------------------------------------------------------
+  // Configure inputs
+  // ----------------------------------------------------------
+
+  Serial.println("Configuring inputs...");
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    pinMode(inputPins[i], INPUT_PULLUP);
+
+    currentState[i] = digitalRead(inputPins[i]);
+
+    lastChangeTime[i] = 0;
+
+
+    // --------------------------------------------------------
+    // Display initial input state
+    // --------------------------------------------------------
+
+    Serial.print("Input ");
+    Serial.print(i + 1);
+
+    Serial.print(" - ");
+    Serial.print(inputNames[i]);
+
+    Serial.print(" - Pin ");
+
+    if (inputPins[i] >= A0) {
+
+      Serial.print("A");
+      Serial.println(inputPins[i] - A0);
+
+    }
+    else {
+
+      Serial.print("D");
+      Serial.println(inputPins[i]);
+
+    }
+  }
+
+
+  Serial.println();
+  Serial.println("Initial input states:");
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    Serial.print("  ");
+    Serial.print(inputNames[i]);
+    Serial.print(": ");
+
+    if (currentState[i] == LOW) {
+      Serial.println("ACTIVE");
+    }
+    else {
+      Serial.println("OFF");
+    }
+  }
+
+
+  Serial.println();
+  Serial.println("Sending initial PING to Mega...");
+
+  MegaSerial.println("PING");
+
+  Serial.println("Nano ESP32 ready.");
+  Serial.println();
+
+}
+
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+
+  unsigned long now = millis();
+
+
+  // ==========================================================
+  // CHECK ALL 10 INPUTS
+  // ==========================================================
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    bool reading = digitalRead(inputPins[i]);
+
+
+    // --------------------------------------------------------
+    // Has the input changed?
+    // --------------------------------------------------------
+
+    if (reading != currentState[i]) {
+
+      // Start debounce timer
+
+      if (lastChangeTime[i] == 0) {
+
+        lastChangeTime[i] = now;
+
+      }
+
+
+      // ------------------------------------------------------
+      // Has it remained changed for 50 milliseconds?
+      // ------------------------------------------------------
+
+      if (now - lastChangeTime[i] >= DEBOUNCE_TIME) {
+
+        currentState[i] = reading;
+
+        lastChangeTime[i] = 0;
+
+
+        // ====================================================
+        // INPUT GROUNDED
+        // LOW = ACTIVE
+        // ====================================================
+
+        if (currentState[i] == LOW) {
+
+          sendStartCommand(i);
+
+        }
+
+
+        // ====================================================
+        // INPUT RELEASED
+        // HIGH = OFF
+        // ====================================================
+
+        else {
+
+          sendStopCommand(i);
+
+        }
+
+      }
+
+    }
+
+    else {
+
+      // Input is stable
+
+      lastChangeTime[i] = 0;
+
+    }
+
+  }
+
+
+  // ==========================================================
+  // HEARTBEAT
+  // ==========================================================
+
+  if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+
+    lastHeartbeat = now;
+
+    sendPing();
+
+  }
+
+
+  // ==========================================================
+  // CHECK FOR DATA FROM MEGA
+  // ==========================================================
+  //
+  // This isn't required yet, but it allows us to see anything
+  // the Mega sends back.
+  //
+  // We'll use this later for ACK, BUSY, DONE, etc.
+  // ==========================================================
+
+  while (MegaSerial.available()) {
+
+    String message = MegaSerial.readStringUntil('\n');
+
+    message.trim();
+
+    if (message.length() > 0) {
+
+      Serial.print("MEGA -> NANO: ");
+      Serial.println(message);
+
+    }
+
+  }
+
+}
+
+
+// ============================================================
+// SEND START COMMAND
+// ============================================================
+
+void sendStartCommand(byte inputNumber) {
+
+  // ----------------------------------------------------------
+  // Send to Mega
+  // ----------------------------------------------------------
+
+  MegaSerial.print("START ");
+  MegaSerial.println(inputNames[inputNumber]);
+
+
+  // ----------------------------------------------------------
+  // Display on USB Serial Monitor
+  // ----------------------------------------------------------
+
+  Serial.print("INPUT ");
+  Serial.print(inputNumber + 1);
+
+  Serial.print(" - ");
+  Serial.print(inputNames[inputNumber]);
+
+  Serial.println(" ACTIVE");
+
+
+  Serial.print("NANO -> MEGA: START ");
+  Serial.println(inputNames[inputNumber]);
+
+}
+
+
+// ============================================================
+// SEND STOP COMMAND
+// ============================================================
+
+void sendStopCommand(byte inputNumber) {
+
+  // ----------------------------------------------------------
+  // Send to Mega
+  // ----------------------------------------------------------
+
+  MegaSerial.print("STOP ");
+  MegaSerial.println(inputNames[inputNumber]);
+
+
+  // ----------------------------------------------------------
+  // Display on USB Serial Monitor
+  // ----------------------------------------------------------
+
+  Serial.print("INPUT ");
+  Serial.print(inputNumber + 1);
+
+  Serial.print(" - ");
+  Serial.print(inputNames[inputNumber]);
+
+  Serial.println(" OFF");
+
+
+  Serial.print("NANO -> MEGA: STOP ");
+  Serial.println(inputNames[inputNumber]);
+
+}
+
+
+// ============================================================
+// SEND HEARTBEAT
+// ============================================================
+
+void sendPing() {
+
+  MegaSerial.println("PING");
+
+  Serial.println("NANO -> MEGA: PING");
+
+}
