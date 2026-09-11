@@ -1,0 +1,3786 @@
+// ============================================================================
+// CODE 3 MX7000 CENTRAL CONTROLLER
+// Arduino Nano ESP32
+// ============================================================================
+//
+// Nano responsibilities:
+//
+//   - Read 10 physical ground-triggered switches
+//   - Receive touchscreen commands from Arduino GIGA
+//   - Arbitrate physical + GIGA requests
+//   - Control Arduino Mega 2560
+//   - Track Mega command acknowledgements
+//   - Track Mega PING/PONG link health
+//   - Forward detailed diagnostics to GIGA
+//   - Hold physical switches that are ON at Nano boot for 120 seconds
+//   - Preserve physical control if GIGA disappears
+//   - Resynchronize Mega after Mega reboot/recovery/link restoration
+//
+// ---------------------------------------------------------------------------
+// NANO <-> MEGA
+//
+// Nano D10 TX -> Mega D19 RX1
+// Nano D11 RX <- Mega D18 TX1
+//
+// IMPORTANT:
+// Mega TX is 5V and Nano ESP32 RX is 3.3V.
+// Use a level shifter or voltage divider on:
+//
+// Mega D18 TX1 -> Nano D11 RX
+//
+// ---------------------------------------------------------------------------
+// NANO <-> GIGA
+//
+// Nano D13 TX -> GIGA D0 RX
+// Nano D12 RX <- GIGA D1 TX
+// Common ground
+//
+// ============================================================================
+
+#include <Arduino.h>
+
+
+// ============================================================================
+// SERIAL PORTS
+// ============================================================================
+
+HardwareSerial MegaSerial(1);
+HardwareSerial GigaSerial(2);
+
+const int MEGA_RX_PIN = D11;
+const int MEGA_TX_PIN = D10;
+
+const int GIGA_RX_PIN = D12;
+const int GIGA_TX_PIN = D13;
+
+const unsigned long USB_BAUD  = 115200;
+const unsigned long MEGA_BAUD = 38400;
+const unsigned long GIGA_BAUD = 38400;
+
+
+// ============================================================================
+// COMMANDS
+// ============================================================================
+
+const byte NUM_INPUTS = 10;
+
+const byte CMD_OUTERS          = 0;
+const byte CMD_INTERMEDIATES   = 1;
+const byte CMD_INNERS          = 2;
+const byte CMD_TRAFFICBREAKERS = 3;
+const byte CMD_LEDS            = 4;
+
+const byte CMD_TLEFT           = 5;
+const byte CMD_TRIGHT          = 6;
+const byte CMD_TOUT            = 7;
+
+const byte CMD_LEFTSIGNAL      = 8;
+const byte CMD_RIGHTSIGNAL     = 9;
+
+
+const char* commandNames[NUM_INPUTS] = {
+  "OUTERS",
+  "INTERMEDIATES",
+  "INNERS",
+  "TRAFFICBREAKERS",
+  "LEDS",
+  "TLEFT",
+  "TRIGHT",
+  "TOUT",
+  "LEFTSIGNAL",
+  "RIGHTSIGNAL"
+};
+
+
+// ============================================================================
+// PHYSICAL INPUTS
+// ============================================================================
+//
+// Active LOW:
+//
+// HIGH = OFF
+// LOW  = ON / grounded
+//
+// ============================================================================
+
+const int inputPins[NUM_INPUTS] = {
+  D2,   // OUTERS
+  D3,   // INTERMEDIATES
+  D4,   // INNERS
+  D5,   // TRAFFICBREAKERS
+  D6,   // LEDS
+  D7,   // TLEFT
+  D8,   // TRIGHT
+  D9,   // TOUT
+  A0,   // LEFTSIGNAL
+  A1    // RIGHTSIGNAL
+};
+
+
+const unsigned long DEBOUNCE_TIME = 50UL;
+
+bool rawPhysicalState[NUM_INPUTS];
+bool currentPhysicalState[NUM_INPUTS];
+
+unsigned long physicalChangeTime[NUM_INPUTS];
+
+
+// ============================================================================
+// REQUEST STATE
+// ============================================================================
+
+bool physicalRequest[NUM_INPUTS];
+bool gigaRequest[NUM_INPUTS];
+
+
+// ============================================================================
+// 120 SECOND STARTUP PHYSICAL HOLD
+// ============================================================================
+//
+// ONLY physical switches already ON when Nano boots are held.
+//
+// During hold:
+//
+// P=1
+// H=1
+// E may remain 0
+// M may remain 0
+//
+// GIGA should FLASH BLUE.
+//
+// If switch is turned OFF:
+//   Hold is permanently cancelled for that switch.
+//
+// If switch is turned back ON:
+//   It is treated as deliberate activation and operates immediately.
+//
+// GIGA commands are NEVER held.
+//
+// ============================================================================
+
+const unsigned long PHYSICAL_STARTUP_HOLD_TIME = 120000UL;
+
+bool startupPhysicalHold[NUM_INPUTS];
+
+unsigned long nanoBootTime = 0;
+
+
+// Optional diagnostic countdown reporting
+
+const unsigned long HOLD_DIAG_INTERVAL = 10000UL;
+
+unsigned long lastHoldDiagTime = 0;
+
+
+// ============================================================================
+// TRAFFIC ADVISOR SOURCE PRIORITY
+// ============================================================================
+//
+// Newest active source wins.
+//
+// ============================================================================
+
+unsigned long taActivationCounter = 0;
+
+unsigned long physicalTAOrder[NUM_INPUTS];
+unsigned long gigaTAOrder[NUM_INPUTS];
+
+
+// ============================================================================
+// MEGA CONFIRMED STATE
+// ============================================================================
+//
+// For non-TA commands:
+//
+// megaConfirmedState[]
+//
+// For TA:
+//
+// confirmedTAMode
+//
+// -1 = no TA mode confirmed
+//
+// ============================================================================
+
+bool megaConfirmedState[NUM_INPUTS];
+
+int confirmedTAMode = -1;
+
+
+// ============================================================================
+// MEGA COMMAND TRANSPORT
+// ============================================================================
+
+const unsigned long MEGA_COMMAND_TIMEOUT = 1500UL;
+
+const byte MEGA_MAX_RETRIES = 2;
+
+
+// Initial transmission + 2 retries = 3 attempts total.
+
+struct MegaPendingCommand {
+
+  bool active;
+
+  bool targetState;
+
+  byte retries;
+
+  unsigned long sentAt;
+
+  bool partOfResync;
+
+};
+
+MegaPendingCommand megaPending[NUM_INPUTS];
+
+
+// ============================================================================
+// COMMAND FAILURE LATCHES
+// ============================================================================
+//
+// Prevent a failed command from being resent continuously forever.
+//
+// A failure latch clears when:
+//
+// - desired state changes
+// - user requests command again
+// - physical state changes
+// - Mega link recovers
+// - Mega reboots/recoveries trigger a resync
+//
+// ============================================================================
+
+bool commandFailureLatched[NUM_INPUTS];
+
+bool commandFailedTarget[NUM_INPUTS];
+
+
+// TA needs one system-level failure state because only one TA mode can run.
+
+bool taFailureLatched = false;
+
+int taFailedDesiredMode = -2;
+
+
+// ============================================================================
+// GIGA COMMAND TRANSACTIONS
+// ============================================================================
+//
+// Nano immediately sends:
+//
+// ACK START OUTERS
+//
+// meaning:
+//
+// "Nano received and accepted your request."
+//
+// After effective Mega state is reconciled:
+//
+// CONFIRMED START OUTERS
+//
+// On failure:
+//
+// FAILED START OUTERS MEGA_NO_ACK
+//
+// or:
+//
+// FAILED START OUTERS MEGA_LINK_LOST
+//
+// ============================================================================
+
+bool gigaTransactionPending[NUM_INPUTS];
+
+bool gigaTransactionWasStart[NUM_INPUTS];
+
+
+// ============================================================================
+// MEGA HEARTBEAT
+// ============================================================================
+
+const unsigned long MEGA_PING_INTERVAL = 5000UL;
+
+const unsigned long MEGA_PONG_TIMEOUT = 15000UL;
+
+unsigned long lastMegaPing = 0;
+
+unsigned long lastMegaPong = 0;
+
+bool megaConnected = false;
+
+bool megaLossAnnounced = false;
+
+
+// ============================================================================
+// GIGA HEARTBEAT
+// ============================================================================
+
+const unsigned long GIGA_TIMEOUT = 60000UL;
+
+unsigned long lastGigaHeartbeat = 0;
+
+bool gigaConnected = false;
+
+bool bootNoticeSentToGiga = false;
+
+
+// ============================================================================
+// FULL MEGA RESYNC
+// ============================================================================
+//
+// After:
+//
+// MEGA_BOOT
+// MEGA_RECOVERED
+// restored PONG after link loss
+//
+// Nano explicitly sends the desired state for ALL TEN commands.
+//
+// This guarantees that Nano becomes authoritative again.
+//
+// ============================================================================
+
+bool fullMegaResyncActive = false;
+
+byte fullMegaResyncIndex = 0;
+
+
+// ============================================================================
+// NON-BLOCKING UART BUFFERS
+// ============================================================================
+
+const byte GIGA_RX_BUFFER_SIZE = 100;
+const byte MEGA_RX_BUFFER_SIZE = 100;
+
+char gigaRxBuffer[GIGA_RX_BUFFER_SIZE];
+char megaRxBuffer[MEGA_RX_BUFFER_SIZE];
+
+byte gigaRxIndex = 0;
+byte megaRxIndex = 0;
+
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+
+bool isTrafficAdvisorCommand(byte command);
+
+int findCommandIndex(const char* command);
+
+bool desiredDirectState(byte command);
+
+int findDesiredTrafficAdvisor();
+
+void checkPhysicalInputs();
+
+void updateStartupHolds();
+
+void reportStartupHoldCountdown();
+
+void processPhysicalStart(byte command);
+
+void processPhysicalStop(byte command);
+
+void checkGigaSerial();
+
+void processGigaMessage(const char* message);
+
+void processGigaStart(byte command);
+
+void processGigaStop(byte command);
+
+void checkMegaSerial();
+
+void processMegaMessage(const char* message);
+
+void sendMegaPing();
+
+void updateMegaLinkWatchdog();
+
+void markMegaLinkLost(const char* reason);
+
+void markMegaLinkRestored();
+
+void invalidateMegaConfirmation();
+
+void startFullMegaResync();
+
+void serviceFullMegaResync();
+
+void finishFullMegaResync();
+
+void reconcileAll();
+
+void reconcileDirectCommand(byte command);
+
+void reconcileTrafficAdvisor();
+
+void startMegaCommand(
+  byte command,
+  bool targetState,
+  bool partOfResync
+);
+
+void transmitMegaCommand(
+  byte command,
+  bool targetState,
+  bool retry
+);
+
+void checkMegaCommandTimeouts();
+
+void handleMegaCommandFailure(byte command);
+
+void handleMegaAck(
+  bool targetState,
+  byte command
+);
+
+void applyMegaConfirmation(
+  byte command,
+  bool targetState
+);
+
+void cancelPendingMegaCommands();
+
+void clearCommandFailure(byte command);
+
+void clearAllCommandFailures();
+
+void resolveGigaTransactions();
+
+void confirmGigaTransaction(byte command);
+
+void failGigaTransaction(
+  byte command,
+  const char* reason
+);
+
+void updateGigaWatchdog();
+
+void clearGigaRequests();
+
+void sendStateToGiga(byte command);
+
+void sendAllStatesToGiga();
+
+void sendAllTrafficAdvisorStates();
+
+void sendGigaAck(
+  bool start,
+  byte command
+);
+
+void sendGigaConfirmed(
+  bool start,
+  byte command
+);
+
+void sendGigaFailed(
+  bool start,
+  byte command,
+  const char* reason
+);
+
+void sendDiag(const char* text);
+
+void sendDiagCommand(
+  const char* direction,
+  const char* action,
+  byte command
+);
+
+void sendMegaLinkStateToGiga();
+
+
+// ============================================================================
+// SETUP
+// ============================================================================
+
+void setup() {
+
+  Serial.begin(USB_BAUD);
+
+  delay(500);
+
+  Serial.println();
+  Serial.println("==========================================");
+  Serial.println(" CODE 3 MX7000 - NANO ESP32 CONTROLLER");
+  Serial.println("==========================================");
+  Serial.println();
+
+
+  // ------------------------------------------------------------------------
+  // UARTS
+  // ------------------------------------------------------------------------
+
+  MegaSerial.begin(
+    MEGA_BAUD,
+    SERIAL_8N1,
+    MEGA_RX_PIN,
+    MEGA_TX_PIN
+  );
+
+  GigaSerial.begin(
+    GIGA_BAUD,
+    SERIAL_8N1,
+    GIGA_RX_PIN,
+    GIGA_TX_PIN
+  );
+
+
+  // ------------------------------------------------------------------------
+  // INITIALIZE STATE
+  // ------------------------------------------------------------------------
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    physicalRequest[i] = false;
+    gigaRequest[i] = false;
+
+    megaConfirmedState[i] = false;
+
+    startupPhysicalHold[i] = false;
+
+    physicalTAOrder[i] = 0;
+    gigaTAOrder[i] = 0;
+
+    gigaTransactionPending[i] = false;
+    gigaTransactionWasStart[i] = false;
+
+    commandFailureLatched[i] = false;
+    commandFailedTarget[i] = false;
+
+    megaPending[i].active = false;
+    megaPending[i].targetState = false;
+    megaPending[i].retries = 0;
+    megaPending[i].sentAt = 0;
+    megaPending[i].partOfResync = false;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // PHYSICAL INPUTS
+  // ------------------------------------------------------------------------
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    pinMode(
+      inputPins[i],
+      INPUT_PULLUP
+    );
+
+  }
+
+
+  delay(20);
+
+
+  // ------------------------------------------------------------------------
+  // READ PHYSICAL STATE AT BOOT
+  // ------------------------------------------------------------------------
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    bool active =
+      digitalRead(inputPins[i]) == LOW;
+
+    rawPhysicalState[i] = active;
+
+    currentPhysicalState[i] = active;
+
+    physicalRequest[i] = active;
+
+    physicalChangeTime[i] = millis();
+
+
+    if (active) {
+
+      // Any physical switch active at startup gets held.
+
+      startupPhysicalHold[i] = true;
+
+
+      // Preserve deterministic TA startup ordering.
+
+      if (isTrafficAdvisorCommand(i)) {
+
+        taActivationCounter++;
+
+        physicalTAOrder[i] =
+          taActivationCounter;
+
+      }
+
+
+      Serial.print("Startup physical HOLD: ");
+      Serial.println(commandNames[i]);
+
+    }
+
+  }
+
+
+  nanoBootTime = millis();
+
+
+  // ------------------------------------------------------------------------
+  // INITIAL MEGA PING
+  // ------------------------------------------------------------------------
+
+  sendMegaPing();
+
+  lastMegaPing = millis();
+
+
+  Serial.println();
+  Serial.println("Nano ready.");
+  Serial.println("Waiting for GIGA and Mega.");
+  Serial.println();
+
+}
+
+
+// ============================================================================
+// LOOP
+// ============================================================================
+
+void loop() {
+
+  checkPhysicalInputs();
+
+  updateStartupHolds();
+
+  reportStartupHoldCountdown();
+
+
+  checkGigaSerial();
+
+  checkMegaSerial();
+
+
+  // ------------------------------------------------------------------------
+  // MEGA HEARTBEAT
+  // ------------------------------------------------------------------------
+
+  if (
+    millis() - lastMegaPing
+    >=
+    MEGA_PING_INTERVAL
+  ) {
+
+    sendMegaPing();
+
+    lastMegaPing =
+      millis();
+
+  }
+
+
+  updateMegaLinkWatchdog();
+
+
+  // ------------------------------------------------------------------------
+  // MEGA COMMAND RETRIES
+  // ------------------------------------------------------------------------
+
+  checkMegaCommandTimeouts();
+
+
+  // ------------------------------------------------------------------------
+  // FULL RESYNC
+  // ------------------------------------------------------------------------
+
+  serviceFullMegaResync();
+
+
+  // ------------------------------------------------------------------------
+  // NORMAL RECONCILIATION
+  // ------------------------------------------------------------------------
+
+  if (!fullMegaResyncActive) {
+
+    reconcileAll();
+
+  }
+
+
+  resolveGigaTransactions();
+
+  updateGigaWatchdog();
+
+}
+
+
+// ============================================================================
+// TRAFFIC ADVISOR HELPER
+// ============================================================================
+
+bool isTrafficAdvisorCommand(byte command) {
+
+  return (
+    command == CMD_TLEFT
+    ||
+    command == CMD_TRIGHT
+    ||
+    command == CMD_TOUT
+  );
+
+}
+
+
+// ============================================================================
+// FIND COMMAND INDEX
+// ============================================================================
+
+int findCommandIndex(const char* command) {
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    if (
+      strcasecmp(
+        command,
+        commandNames[i]
+      )
+      ==
+      0
+    ) {
+
+      return i;
+
+    }
+
+  }
+
+
+  return -1;
+
+}
+
+
+// ============================================================================
+// DESIRED DIRECT STATE
+// ============================================================================
+//
+// Startup-held physical requests do not contribute to effective state.
+//
+// GIGA request always contributes.
+//
+// ============================================================================
+
+bool desiredDirectState(byte command) {
+
+  bool physicalEffective =
+
+    physicalRequest[command]
+    &&
+    !startupPhysicalHold[command];
+
+
+  return (
+    physicalEffective
+    ||
+    gigaRequest[command]
+  );
+
+}
+
+
+// ============================================================================
+// FIND DESIRED TRAFFIC ADVISOR MODE
+// ============================================================================
+
+int findDesiredTrafficAdvisor() {
+
+  int winner = -1;
+
+  unsigned long newestOrder = 0;
+
+
+  for (
+    byte command = CMD_TLEFT;
+    command <= CMD_TOUT;
+    command++
+  ) {
+
+    // ----------------------------------------------------------------------
+    // PHYSICAL SOURCE
+    // ----------------------------------------------------------------------
+
+    if (
+      physicalRequest[command]
+      &&
+      !startupPhysicalHold[command]
+      &&
+      physicalTAOrder[command] > newestOrder
+    ) {
+
+      newestOrder =
+        physicalTAOrder[command];
+
+      winner =
+        command;
+
+    }
+
+
+    // ----------------------------------------------------------------------
+    // GIGA SOURCE
+    // ----------------------------------------------------------------------
+
+    if (
+      gigaRequest[command]
+      &&
+      gigaTAOrder[command] > newestOrder
+    ) {
+
+      newestOrder =
+        gigaTAOrder[command];
+
+      winner =
+        command;
+
+    }
+
+  }
+
+
+  return winner;
+
+}
+
+
+// ============================================================================
+// PHYSICAL INPUT SCAN
+// ============================================================================
+
+void checkPhysicalInputs() {
+
+  unsigned long now =
+    millis();
+
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    bool reading =
+      digitalRead(inputPins[i]) == LOW;
+
+
+    // ----------------------------------------------------------------------
+    // RAW CHANGE
+    // ----------------------------------------------------------------------
+
+    if (
+      reading
+      !=
+      rawPhysicalState[i]
+    ) {
+
+      rawPhysicalState[i] =
+        reading;
+
+      physicalChangeTime[i] =
+        now;
+
+    }
+
+
+    // ----------------------------------------------------------------------
+    // DEBOUNCED CHANGE
+    // ----------------------------------------------------------------------
+
+    if (
+      reading
+      !=
+      currentPhysicalState[i]
+      &&
+      now - physicalChangeTime[i]
+      >=
+      DEBOUNCE_TIME
+    ) {
+
+      currentPhysicalState[i] =
+        reading;
+
+
+      if (reading) {
+
+        processPhysicalStart(i);
+
+      }
+
+      else {
+
+        processPhysicalStop(i);
+
+      }
+
+    }
+
+  }
+
+}
+
+
+// ============================================================================
+// PHYSICAL START
+// ============================================================================
+
+void processPhysicalStart(byte command) {
+
+  physicalRequest[command] =
+    true;
+
+
+  // This is a deliberate activation after boot.
+  // It does NOT get the original startup hold.
+
+  startupPhysicalHold[command] =
+    false;
+
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    taActivationCounter++;
+
+    physicalTAOrder[command] =
+      taActivationCounter;
+
+  }
+
+
+  clearCommandFailure(command);
+
+
+  Serial.print("PHYSICAL START: ");
+  Serial.println(commandNames[command]);
+
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    sendAllTrafficAdvisorStates();
+
+  }
+
+  else {
+
+    sendStateToGiga(command);
+
+  }
+
+
+  reconcileAll();
+
+}
+
+
+// ============================================================================
+// PHYSICAL STOP
+// ============================================================================
+
+void processPhysicalStop(byte command) {
+
+  physicalRequest[command] =
+    false;
+
+
+  // If this was a startup-held switch, turning it OFF cancels
+  // the hold permanently.
+
+  if (
+    startupPhysicalHold[command]
+  ) {
+
+    startupPhysicalHold[command] =
+      false;
+
+
+    char diag[100];
+
+    snprintf(
+      diag,
+      sizeof(diag),
+      "STARTUP_HOLD_CANCELLED %s",
+      commandNames[command]
+    );
+
+    sendDiag(diag);
+
+  }
+
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    physicalTAOrder[command] =
+      0;
+
+  }
+
+
+  clearCommandFailure(command);
+
+
+  Serial.print("PHYSICAL STOP: ");
+  Serial.println(commandNames[command]);
+
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    sendAllTrafficAdvisorStates();
+
+  }
+
+  else {
+
+    sendStateToGiga(command);
+
+  }
+
+
+  reconcileAll();
+
+}
+
+
+// ============================================================================
+// STARTUP HOLD PROCESSING
+// ============================================================================
+
+void updateStartupHolds() {
+
+  unsigned long elapsed =
+
+    millis()
+    -
+    nanoBootTime;
+
+
+  if (
+    elapsed
+    <
+    PHYSICAL_STARTUP_HOLD_TIME
+  ) {
+
+    return;
+
+  }
+
+
+  bool taChanged = false;
+
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    if (
+      !startupPhysicalHold[i]
+    ) {
+
+      continue;
+
+    }
+
+
+    // ----------------------------------------------------------------------
+    // RELEASE STARTUP HOLD
+    // ----------------------------------------------------------------------
+
+    startupPhysicalHold[i] =
+      false;
+
+
+    char diag[100];
+
+    snprintf(
+      diag,
+      sizeof(diag),
+      "STARTUP_HOLD_RELEASED %s",
+      commandNames[i]
+    );
+
+    sendDiag(diag);
+
+
+    Serial.print("Startup hold released: ");
+    Serial.println(commandNames[i]);
+
+
+    if (isTrafficAdvisorCommand(i)) {
+
+      taChanged =
+        true;
+
+    }
+
+    else {
+
+      sendStateToGiga(i);
+
+    }
+
+  }
+
+
+  if (taChanged) {
+
+    sendAllTrafficAdvisorStates();
+
+  }
+
+
+  reconcileAll();
+
+}
+
+
+// ============================================================================
+// STARTUP HOLD COUNTDOWN DIAGNOSTIC
+// ============================================================================
+
+void reportStartupHoldCountdown() {
+
+  if (
+    millis() - lastHoldDiagTime
+    <
+    HOLD_DIAG_INTERVAL
+  ) {
+
+    return;
+
+  }
+
+
+  lastHoldDiagTime =
+    millis();
+
+
+  unsigned long elapsed =
+
+    millis()
+    -
+    nanoBootTime;
+
+
+  if (
+    elapsed >= PHYSICAL_STARTUP_HOLD_TIME
+  ) {
+
+    return;
+
+  }
+
+
+  unsigned long remainingMs =
+
+    PHYSICAL_STARTUP_HOLD_TIME
+    -
+    elapsed;
+
+
+  unsigned long remainingSeconds =
+
+    (remainingMs + 999UL)
+    /
+    1000UL;
+
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    if (
+      startupPhysicalHold[i]
+      &&
+      physicalRequest[i]
+    ) {
+
+      char message[100];
+
+      snprintf(
+        message,
+        sizeof(message),
+        "HOLD %s %lu",
+        commandNames[i],
+        remainingSeconds
+      );
+
+
+      if (gigaConnected) {
+
+        GigaSerial.println(message);
+
+      }
+
+
+      Serial.println(message);
+
+    }
+
+  }
+
+}
+
+
+// ============================================================================
+// GIGA NON-BLOCKING SERIAL
+// ============================================================================
+
+void checkGigaSerial() {
+
+  while (
+    GigaSerial.available() > 0
+  ) {
+
+    char c =
+      GigaSerial.read();
+
+
+    if (c == '\r') {
+
+      continue;
+
+    }
+
+
+    if (c == '\n') {
+
+      if (
+        gigaRxIndex > 0
+      ) {
+
+        gigaRxBuffer[gigaRxIndex] =
+          '\0';
+
+
+        Serial.print("GIGA -> NANO: ");
+        Serial.println(gigaRxBuffer);
+
+
+        processGigaMessage(
+          gigaRxBuffer
+        );
+
+      }
+
+
+      gigaRxIndex =
+        0;
+
+
+      continue;
+
+    }
+
+
+    if (
+      gigaRxIndex
+      <
+      GIGA_RX_BUFFER_SIZE - 1
+    ) {
+
+      gigaRxBuffer[gigaRxIndex++] =
+        c;
+
+    }
+
+    else {
+
+      gigaRxIndex =
+        0;
+
+
+      Serial.println(
+        "ERROR: GIGA RX buffer overflow"
+      );
+
+
+      if (gigaConnected) {
+
+        GigaSerial.println(
+          "ERROR GIGA_RX_OVERFLOW"
+        );
+
+      }
+
+    }
+
+  }
+
+}
+
+
+// ============================================================================
+// PROCESS GIGA MESSAGE
+// ============================================================================
+
+void processGigaMessage(const char* message) {
+
+  // ------------------------------------------------------------------------
+  // HEARTBEAT
+  // ------------------------------------------------------------------------
+
+  if (
+    strcmp(
+      message,
+      "GIGA_PING"
+    )
+    ==
+    0
+  ) {
+
+    bool wasDisconnected =
+      !gigaConnected;
+
+
+    gigaConnected =
+      true;
+
+    lastGigaHeartbeat =
+      millis();
+
+
+    GigaSerial.println(
+      "GIGA_PONG"
+    );
+
+
+    if (
+      !bootNoticeSentToGiga
+    ) {
+
+      GigaSerial.println(
+        "NANO_BOOT"
+      );
+
+      bootNoticeSentToGiga =
+        true;
+
+    }
+
+
+    if (wasDisconnected) {
+
+      sendAllStatesToGiga();
+
+      sendMegaLinkStateToGiga();
+
+    }
+
+
+    return;
+
+  }
+
+
+  // Ignore command traffic until heartbeat established.
+
+  if (!gigaConnected) {
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // SYNC
+  // ------------------------------------------------------------------------
+
+  if (
+    strcmp(
+      message,
+      "SYNC_REQUEST"
+    )
+    ==
+    0
+  ) {
+
+    sendAllStatesToGiga();
+
+    sendMegaLinkStateToGiga();
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // START
+  // ------------------------------------------------------------------------
+
+  if (
+    strncmp(
+      message,
+      "START ",
+      6
+    )
+    ==
+    0
+  ) {
+
+    int command =
+      findCommandIndex(
+        message + 6
+      );
+
+
+    if (command < 0) {
+
+      GigaSerial.println(
+        "ERROR UNKNOWN_COMMAND"
+      );
+
+      return;
+
+    }
+
+
+    processGigaStart(
+      command
+    );
+
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // STOP
+  // ------------------------------------------------------------------------
+
+  if (
+    strncmp(
+      message,
+      "STOP ",
+      5
+    )
+    ==
+    0
+  ) {
+
+    int command =
+      findCommandIndex(
+        message + 5
+      );
+
+
+    if (command < 0) {
+
+      GigaSerial.println(
+        "ERROR UNKNOWN_COMMAND"
+      );
+
+      return;
+
+    }
+
+
+    processGigaStop(
+      command
+    );
+
+
+    return;
+
+  }
+
+
+  GigaSerial.println(
+    "ERROR UNKNOWN_MESSAGE"
+  );
+
+}
+
+
+// ============================================================================
+// GIGA START
+// ============================================================================
+
+void processGigaStart(byte command) {
+
+  // Nano-stage acknowledgement happens immediately.
+
+  sendGigaAck(
+    true,
+    command
+  );
+
+
+  // Track this request until effective Mega state is reconciled.
+
+  gigaTransactionPending[command] =
+    true;
+
+  gigaTransactionWasStart[command] =
+    true;
+
+
+  // ------------------------------------------------------------------------
+  // NEW SOURCE ACTIVATION
+  // ------------------------------------------------------------------------
+  //
+  // Duplicate retries must NOT steal TA priority.
+  //
+  // ------------------------------------------------------------------------
+
+  if (
+    !gigaRequest[command]
+  ) {
+
+    gigaRequest[command] =
+      true;
+
+
+    if (isTrafficAdvisorCommand(command)) {
+
+      taActivationCounter++;
+
+      gigaTAOrder[command] =
+        taActivationCounter;
+
+    }
+
+  }
+
+
+  clearCommandFailure(command);
+
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    taFailureLatched =
+      false;
+
+    sendAllTrafficAdvisorStates();
+
+  }
+
+  else {
+
+    sendStateToGiga(command);
+
+  }
+
+
+  reconcileAll();
+
+  resolveGigaTransactions();
+
+}
+
+
+// ============================================================================
+// GIGA STOP
+// ============================================================================
+
+void processGigaStop(byte command) {
+
+  sendGigaAck(
+    false,
+    command
+  );
+
+
+  gigaTransactionPending[command] =
+    true;
+
+  gigaTransactionWasStart[command] =
+    false;
+
+
+  gigaRequest[command] =
+    false;
+
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    gigaTAOrder[command] =
+      0;
+
+    taFailureLatched =
+      false;
+
+  }
+
+
+  clearCommandFailure(command);
+
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    sendAllTrafficAdvisorStates();
+
+  }
+
+  else {
+
+    sendStateToGiga(command);
+
+  }
+
+
+  reconcileAll();
+
+  resolveGigaTransactions();
+
+}
+
+
+// ============================================================================
+// MEGA NON-BLOCKING SERIAL
+// ============================================================================
+
+void checkMegaSerial() {
+
+  while (
+    MegaSerial.available() > 0
+  ) {
+
+    char c =
+      MegaSerial.read();
+
+
+    if (c == '\r') {
+
+      continue;
+
+    }
+
+
+    if (c == '\n') {
+
+      if (
+        megaRxIndex > 0
+      ) {
+
+        megaRxBuffer[megaRxIndex] =
+          '\0';
+
+
+        Serial.print("MEGA -> NANO: ");
+        Serial.println(megaRxBuffer);
+
+
+        processMegaMessage(
+          megaRxBuffer
+        );
+
+      }
+
+
+      megaRxIndex =
+        0;
+
+
+      continue;
+
+    }
+
+
+    if (
+      megaRxIndex
+      <
+      MEGA_RX_BUFFER_SIZE - 1
+    ) {
+
+      megaRxBuffer[megaRxIndex++] =
+        c;
+
+    }
+
+    else {
+
+      megaRxIndex =
+        0;
+
+
+      Serial.println(
+        "ERROR: MEGA RX buffer overflow"
+      );
+
+
+      sendDiag(
+        "NANO_MEGA_RX_OVERFLOW"
+      );
+
+    }
+
+  }
+
+}
+
+
+// ============================================================================
+// PROCESS MEGA MESSAGE
+// ============================================================================
+
+void processMegaMessage(const char* message) {
+
+  // ------------------------------------------------------------------------
+  // PONG
+  // ------------------------------------------------------------------------
+
+  if (
+    strcmp(
+      message,
+      "PONG"
+    )
+    ==
+    0
+  ) {
+
+    bool wasDisconnected =
+      !megaConnected;
+
+
+    lastMegaPong =
+      millis();
+
+
+    megaConnected =
+      true;
+
+
+    sendDiag(
+      "M>N PONG"
+    );
+
+
+    if (wasDisconnected) {
+
+      markMegaLinkRestored();
+
+    }
+
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // MEGA BOOT
+  // ------------------------------------------------------------------------
+
+  if (
+    strcmp(
+      message,
+      "MEGA_BOOT"
+    )
+    ==
+    0
+  ) {
+
+    sendDiag(
+      "MEGA_REBOOTED"
+    );
+
+
+    if (gigaConnected) {
+
+      GigaSerial.println(
+        "MEGA_REBOOTED"
+      );
+
+    }
+
+
+    // A reboot invalidates every previous confirmation.
+
+    megaConnected =
+      false;
+
+    megaLossAnnounced =
+      false;
+
+
+    invalidateMegaConfirmation();
+
+    cancelPendingMegaCommands();
+
+
+    // Ask the newly booted Mega for a fresh heartbeat.
+
+    sendMegaPing();
+
+    lastMegaPing =
+      millis();
+
+
+    // Red border until fresh PONG proves the link.
+
+    markMegaLinkLost(
+      "MEGA_REBOOTED"
+    );
+
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // MEGA FAILSAFE
+  // ------------------------------------------------------------------------
+
+  if (
+    strcmp(
+      message,
+      "MEGA_FAILSAFE"
+    )
+    ==
+    0
+  ) {
+
+    sendDiag(
+      "MEGA_FAILSAFE"
+    );
+
+
+    if (gigaConnected) {
+
+      GigaSerial.println(
+        "MEGA_FAILSAFE"
+      );
+
+    }
+
+
+    markMegaLinkLost(
+      "MEGA_FAILSAFE"
+    );
+
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // MEGA RECOVERED
+  // ------------------------------------------------------------------------
+
+  if (
+    strcmp(
+      message,
+      "MEGA_RECOVERED"
+    )
+    ==
+    0
+  ) {
+
+    sendDiag(
+      "MEGA_RECOVERED"
+    );
+
+
+    if (gigaConnected) {
+
+      GigaSerial.println(
+        "MEGA_RECOVERED"
+      );
+
+    }
+
+
+    invalidateMegaConfirmation();
+
+    cancelPendingMegaCommands();
+
+    clearAllCommandFailures();
+
+
+    if (megaConnected) {
+
+      startFullMegaResync();
+
+    }
+
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // ACK START
+  // ------------------------------------------------------------------------
+
+  if (
+    strncmp(
+      message,
+      "ACK START ",
+      10
+    )
+    ==
+    0
+  ) {
+
+    int command =
+      findCommandIndex(
+        message + 10
+      );
+
+
+    if (command >= 0) {
+
+      handleMegaAck(
+        true,
+        command
+      );
+
+    }
+
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // ACK STOP
+  // ------------------------------------------------------------------------
+
+  if (
+    strncmp(
+      message,
+      "ACK STOP ",
+      9
+    )
+    ==
+    0
+  ) {
+
+    int command =
+      findCommandIndex(
+        message + 9
+      );
+
+
+    if (command >= 0) {
+
+      handleMegaAck(
+        false,
+        command
+      );
+
+    }
+
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // MEGA ERROR
+  // ------------------------------------------------------------------------
+
+  if (
+    strncmp(
+      message,
+      "ERROR ",
+      6
+    )
+    ==
+    0
+  ) {
+
+    char diag[130];
+
+    snprintf(
+      diag,
+      sizeof(diag),
+      "M>N %s",
+      message
+    );
+
+
+    sendDiag(diag);
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // UNKNOWN MEGA MESSAGE
+  // ------------------------------------------------------------------------
+
+  char diag[130];
+
+  snprintf(
+    diag,
+    sizeof(diag),
+    "UNKNOWN_MEGA_MESSAGE %s",
+    message
+  );
+
+  sendDiag(diag);
+
+}
+
+
+// ============================================================================
+// SEND MEGA PING
+// ============================================================================
+
+void sendMegaPing() {
+
+  MegaSerial.println(
+    "PING"
+  );
+
+
+  Serial.println(
+    "NANO -> MEGA: PING"
+  );
+
+
+  sendDiag(
+    "N>M PING"
+  );
+
+}
+
+
+// ============================================================================
+// MEGA LINK WATCHDOG
+// ============================================================================
+
+void updateMegaLinkWatchdog() {
+
+  // ------------------------------------------------------------------------
+  // NEVER RECEIVED PONG
+  // ------------------------------------------------------------------------
+
+  if (!megaConnected) {
+
+    if (
+      !megaLossAnnounced
+      &&
+      millis() - nanoBootTime
+      >=
+      MEGA_PONG_TIMEOUT
+    ) {
+
+      markMegaLinkLost(
+        "MEGA_NO_PONG"
+      );
+
+    }
+
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // ACTIVE LINK TIMED OUT
+  // ------------------------------------------------------------------------
+
+  if (
+    millis() - lastMegaPong
+    >=
+    MEGA_PONG_TIMEOUT
+  ) {
+
+    markMegaLinkLost(
+      "MEGA_NO_PONG"
+    );
+
+  }
+
+}
+
+
+// ============================================================================
+// MARK MEGA LINK LOST
+// ============================================================================
+
+void markMegaLinkLost(const char* reason) {
+
+  bool newlyLost =
+    megaConnected
+    ||
+    !megaLossAnnounced;
+
+
+  megaConnected =
+    false;
+
+
+  if (!newlyLost) {
+
+    return;
+
+  }
+
+
+  megaLossAnnounced =
+    true;
+
+
+  Serial.print(
+    "MEGA LINK LOST: "
+  );
+
+  Serial.println(
+    reason
+  );
+
+
+  invalidateMegaConfirmation();
+
+  cancelPendingMegaCommands();
+
+
+  // ------------------------------------------------------------------------
+  // FAIL ANY ACTIVE GIGA COMMAND TRANSACTIONS
+  // ------------------------------------------------------------------------
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    if (
+      gigaTransactionPending[i]
+    ) {
+
+      failGigaTransaction(
+        i,
+        "MEGA_LINK_LOST"
+      );
+
+    }
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // RED BORDER MESSAGE
+  // ------------------------------------------------------------------------
+
+  if (gigaConnected) {
+
+    GigaSerial.println(
+      "MEGA_LINK_LOST"
+    );
+
+  }
+
+
+  char diag[120];
+
+  snprintf(
+    diag,
+    sizeof(diag),
+    "MEGA_LINK_LOST CAUSE=%s",
+    reason
+  );
+
+  sendDiag(diag);
+
+
+  sendAllStatesToGiga();
+
+}
+
+
+// ============================================================================
+// MARK MEGA LINK RESTORED
+// ============================================================================
+
+void markMegaLinkRestored() {
+
+  megaConnected =
+    true;
+
+  megaLossAnnounced =
+    false;
+
+
+  Serial.println(
+    "MEGA LINK RESTORED"
+  );
+
+
+  if (gigaConnected) {
+
+    GigaSerial.println(
+      "MEGA_LINK_RESTORED"
+    );
+
+  }
+
+
+  sendDiag(
+    "MEGA_LINK_RESTORED"
+  );
+
+
+  clearAllCommandFailures();
+
+  invalidateMegaConfirmation();
+
+  cancelPendingMegaCommands();
+
+
+  // Re-establish all ten states.
+
+  startFullMegaResync();
+
+}
+
+
+// ============================================================================
+// INVALIDATE MEGA CONFIRMATION
+// ============================================================================
+
+void invalidateMegaConfirmation() {
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    megaConfirmedState[i] =
+      false;
+
+  }
+
+
+  confirmedTAMode =
+    -1;
+
+
+  sendAllStatesToGiga();
+
+}
+
+
+// ============================================================================
+// START FULL MEGA RESYNC
+// ============================================================================
+
+void startFullMegaResync() {
+
+  if (!megaConnected) {
+
+    return;
+
+  }
+
+
+  cancelPendingMegaCommands();
+
+
+  fullMegaResyncActive =
+    true;
+
+  fullMegaResyncIndex =
+    0;
+
+
+  sendDiag(
+    "MEGA_RESYNC_BEGIN"
+  );
+
+}
+
+
+// ============================================================================
+// SERVICE FULL MEGA RESYNC
+// ============================================================================
+
+void serviceFullMegaResync() {
+
+  if (!fullMegaResyncActive) {
+
+    return;
+
+  }
+
+
+  if (!megaConnected) {
+
+    fullMegaResyncActive =
+      false;
+
+    return;
+
+  }
+
+
+  if (
+    fullMegaResyncIndex
+    >=
+    NUM_INPUTS
+  ) {
+
+    finishFullMegaResync();
+
+    return;
+
+  }
+
+
+  byte command =
+    fullMegaResyncIndex;
+
+
+  // Wait for current resync command.
+
+  if (
+    megaPending[command].active
+  ) {
+
+    return;
+
+  }
+
+
+  bool target;
+
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    target =
+      findDesiredTrafficAdvisor()
+      ==
+      command;
+
+  }
+
+  else {
+
+    target =
+      desiredDirectState(command);
+
+  }
+
+
+  startMegaCommand(
+    command,
+    target,
+    true
+  );
+
+}
+
+
+// ============================================================================
+// FINISH FULL MEGA RESYNC
+// ============================================================================
+
+void finishFullMegaResync() {
+
+  fullMegaResyncActive =
+    false;
+
+
+  sendDiag(
+    "MEGA_RESYNC_END"
+  );
+
+
+  sendAllStatesToGiga();
+
+  resolveGigaTransactions();
+
+  reconcileAll();
+
+}
+
+
+// ============================================================================
+// RECONCILE EVERYTHING
+// ============================================================================
+
+void reconcileAll() {
+
+  if (fullMegaResyncActive) {
+
+    return;
+
+  }
+
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    if (
+      !isTrafficAdvisorCommand(i)
+    ) {
+
+      reconcileDirectCommand(i);
+
+    }
+
+  }
+
+
+  reconcileTrafficAdvisor();
+
+}
+
+
+// ============================================================================
+// RECONCILE DIRECT COMMAND
+// ============================================================================
+
+void reconcileDirectCommand(byte command) {
+
+  bool desired =
+    desiredDirectState(command);
+
+
+  // ------------------------------------------------------------------------
+  // EXISTING COMMAND IN FLIGHT
+  // ------------------------------------------------------------------------
+
+  if (
+    megaPending[command].active
+  ) {
+
+    if (
+      megaPending[command].targetState
+      ==
+      desired
+    ) {
+
+      return;
+
+    }
+
+
+    // Desired state changed while old command was pending.
+    // Cancel old transaction.
+
+    megaPending[command].active =
+      false;
+
+  }
+
+
+  if (
+    megaConfirmedState[command]
+    ==
+    desired
+  ) {
+
+    return;
+
+  }
+
+
+  if (
+    commandFailureLatched[command]
+    &&
+    commandFailedTarget[command]
+    ==
+    desired
+  ) {
+
+    return;
+
+  }
+
+
+  if (!megaConnected) {
+
+    return;
+
+  }
+
+
+  startMegaCommand(
+    command,
+    desired,
+    false
+  );
+
+}
+
+
+// ============================================================================
+// RECONCILE TRAFFIC ADVISOR
+// ============================================================================
+
+void reconcileTrafficAdvisor() {
+
+  int desiredMode =
+    findDesiredTrafficAdvisor();
+
+
+  // ------------------------------------------------------------------------
+  // CANCEL OBSOLETE TA COMMANDS
+  // ------------------------------------------------------------------------
+
+  for (
+    byte i = CMD_TLEFT;
+    i <= CMD_TOUT;
+    i++
+  ) {
+
+    if (
+      megaPending[i].active
+    ) {
+
+      bool stillCorrect = false;
+
+
+      if (
+        megaPending[i].targetState
+      ) {
+
+        stillCorrect =
+          desiredMode == i;
+
+      }
+
+      else {
+
+        stillCorrect =
+          desiredMode == -1
+          &&
+          confirmedTAMode == i;
+
+      }
+
+
+      if (!stillCorrect) {
+
+        megaPending[i].active =
+          false;
+
+      }
+
+    }
+
+  }
+
+
+  if (
+    confirmedTAMode
+    ==
+    desiredMode
+  ) {
+
+    return;
+
+  }
+
+
+  if (
+    taFailureLatched
+    &&
+    taFailedDesiredMode
+    ==
+    desiredMode
+  ) {
+
+    return;
+
+  }
+
+
+  if (!megaConnected) {
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // START DESIRED TA
+  // ------------------------------------------------------------------------
+
+  if (
+    desiredMode >= 0
+  ) {
+
+    if (
+      !megaPending[desiredMode].active
+    ) {
+
+      startMegaCommand(
+        desiredMode,
+        true,
+        false
+      );
+
+    }
+
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // STOP CONFIRMED TA
+  // ------------------------------------------------------------------------
+
+  if (
+    confirmedTAMode >= 0
+  ) {
+
+    byte oldMode =
+      confirmedTAMode;
+
+
+    if (
+      !megaPending[oldMode].active
+    ) {
+
+      startMegaCommand(
+        oldMode,
+        false,
+        false
+      );
+
+    }
+
+  }
+
+}
+
+
+// ============================================================================
+// START MEGA COMMAND
+// ============================================================================
+
+void startMegaCommand(
+  byte command,
+  bool targetState,
+  bool partOfResync
+) {
+
+  if (!megaConnected) {
+
+    return;
+
+  }
+
+
+  megaPending[command].active =
+    true;
+
+  megaPending[command].targetState =
+    targetState;
+
+  megaPending[command].retries =
+    0;
+
+  megaPending[command].sentAt =
+    millis();
+
+  megaPending[command].partOfResync =
+    partOfResync;
+
+
+  transmitMegaCommand(
+    command,
+    targetState,
+    false
+  );
+
+}
+
+
+// ============================================================================
+// TRANSMIT MEGA COMMAND
+// ============================================================================
+
+void transmitMegaCommand(
+  byte command,
+  bool targetState,
+  bool retry
+) {
+
+  const char* action =
+
+    targetState
+    ?
+    "START"
+    :
+    "STOP";
+
+
+  MegaSerial.print(action);
+
+  MegaSerial.print(" ");
+
+  MegaSerial.println(
+    commandNames[command]
+  );
+
+
+  if (retry) {
+
+    char diag[120];
+
+    snprintf(
+      diag,
+      sizeof(diag),
+      "N>M RETRY %u %s %s",
+      megaPending[command].retries,
+      action,
+      commandNames[command]
+    );
+
+    sendDiag(diag);
+
+  }
+
+  else {
+
+    sendDiagCommand(
+      "N>M",
+      action,
+      command
+    );
+
+  }
+
+
+  Serial.print("NANO -> MEGA: ");
+  Serial.print(action);
+  Serial.print(" ");
+  Serial.println(commandNames[command]);
+
+}
+
+
+// ============================================================================
+// CHECK MEGA COMMAND TIMEOUTS
+// ============================================================================
+
+void checkMegaCommandTimeouts() {
+
+  if (!megaConnected) {
+
+    return;
+
+  }
+
+
+  unsigned long now =
+    millis();
+
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    if (
+      !megaPending[i].active
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      now - megaPending[i].sentAt
+      <
+      MEGA_COMMAND_TIMEOUT
+    ) {
+
+      continue;
+
+    }
+
+
+    // ----------------------------------------------------------------------
+    // RETRY
+    // ----------------------------------------------------------------------
+
+    if (
+      megaPending[i].retries
+      <
+      MEGA_MAX_RETRIES
+    ) {
+
+      megaPending[i].retries++;
+
+      megaPending[i].sentAt =
+        now;
+
+
+      transmitMegaCommand(
+        i,
+        megaPending[i].targetState,
+        true
+      );
+
+
+      continue;
+
+    }
+
+
+    // ----------------------------------------------------------------------
+    // TERMINAL FAILURE
+    // ----------------------------------------------------------------------
+
+    handleMegaCommandFailure(i);
+
+  }
+
+}
+
+
+// ============================================================================
+// HANDLE MEGA COMMAND FAILURE
+// ============================================================================
+
+void handleMegaCommandFailure(byte command) {
+
+  bool failedTarget =
+    megaPending[command].targetState;
+
+  bool wasResync =
+    megaPending[command].partOfResync;
+
+
+  megaPending[command].active =
+    false;
+
+
+  commandFailureLatched[command] =
+    true;
+
+  commandFailedTarget[command] =
+    failedTarget;
+
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    taFailureLatched =
+      true;
+
+    taFailedDesiredMode =
+      findDesiredTrafficAdvisor();
+
+  }
+
+
+  char diag[120];
+
+  snprintf(
+    diag,
+    sizeof(diag),
+    "MEGA_NO_ACK %s %s",
+    failedTarget ? "START" : "STOP",
+    commandNames[command]
+  );
+
+  sendDiag(diag);
+
+
+  // ------------------------------------------------------------------------
+  // FAIL RELEVANT GIGA TRANSACTIONS
+  // ------------------------------------------------------------------------
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    for (
+      byte i = CMD_TLEFT;
+      i <= CMD_TOUT;
+      i++
+    ) {
+
+      if (
+        gigaTransactionPending[i]
+      ) {
+
+        failGigaTransaction(
+          i,
+          "MEGA_NO_ACK"
+        );
+
+      }
+
+    }
+
+  }
+
+  else {
+
+    if (
+      gigaTransactionPending[command]
+    ) {
+
+      failGigaTransaction(
+        command,
+        "MEGA_NO_ACK"
+      );
+
+    }
+
+  }
+
+
+  sendStateToGiga(command);
+
+
+  // ------------------------------------------------------------------------
+  // CONTINUE RESYNC EVEN IF ONE COMMAND FAILED
+  // ------------------------------------------------------------------------
+
+  if (
+    wasResync
+    &&
+    fullMegaResyncActive
+  ) {
+
+    fullMegaResyncIndex++;
+
+  }
+
+}
+
+
+// ============================================================================
+// HANDLE MEGA ACK
+// ============================================================================
+
+void handleMegaAck(
+  bool targetState,
+  byte command
+) {
+
+  const char* action =
+
+    targetState
+    ?
+    "START"
+    :
+    "STOP";
+
+
+  sendDiagCommand(
+    "M>N",
+    action,
+    command
+  );
+
+
+  // ------------------------------------------------------------------------
+  // MATCH ACTIVE TRANSACTION
+  // ------------------------------------------------------------------------
+
+  if (
+    megaPending[command].active
+    &&
+    megaPending[command].targetState
+    ==
+    targetState
+  ) {
+
+    bool wasResync =
+      megaPending[command].partOfResync;
+
+
+    megaPending[command].active =
+      false;
+
+
+    applyMegaConfirmation(
+      command,
+      targetState
+    );
+
+
+    clearCommandFailure(command);
+
+
+    if (isTrafficAdvisorCommand(command)) {
+
+      taFailureLatched =
+        false;
+
+    }
+
+
+    if (
+      wasResync
+      &&
+      fullMegaResyncActive
+      &&
+      fullMegaResyncIndex == command
+    ) {
+
+      fullMegaResyncIndex++;
+
+    }
+
+
+    resolveGigaTransactions();
+
+    return;
+
+  }
+
+
+  // ------------------------------------------------------------------------
+  // LATE ACK
+  // ------------------------------------------------------------------------
+  //
+  // Only accept a late ACK if it still matches the CURRENT desired state.
+  //
+  // This reduces the risk of an old ACK changing state after the user has
+  // already requested the opposite command.
+  //
+  // ------------------------------------------------------------------------
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    int desiredMode =
+      findDesiredTrafficAdvisor();
+
+
+    if (
+      targetState
+      &&
+      desiredMode == command
+    ) {
+
+      applyMegaConfirmation(
+        command,
+        true
+      );
+
+      resolveGigaTransactions();
+
+    }
+
+    else if (
+      !targetState
+      &&
+      desiredMode == -1
+      &&
+      confirmedTAMode == command
+    ) {
+
+      applyMegaConfirmation(
+        command,
+        false
+      );
+
+      resolveGigaTransactions();
+
+    }
+
+
+    return;
+
+  }
+
+
+  if (
+    desiredDirectState(command)
+    ==
+    targetState
+  ) {
+
+    applyMegaConfirmation(
+      command,
+      targetState
+    );
+
+    clearCommandFailure(command);
+
+    resolveGigaTransactions();
+
+  }
+
+}
+
+
+// ============================================================================
+// APPLY MEGA CONFIRMATION
+// ============================================================================
+
+void applyMegaConfirmation(
+  byte command,
+  bool targetState
+) {
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    if (targetState) {
+
+      confirmedTAMode =
+        command;
+
+    }
+
+    else {
+
+      if (
+        confirmedTAMode
+        ==
+        command
+      ) {
+
+        confirmedTAMode =
+          -1;
+
+      }
+
+    }
+
+
+    sendAllTrafficAdvisorStates();
+
+    return;
+
+  }
+
+
+  megaConfirmedState[command] =
+    targetState;
+
+
+  sendStateToGiga(command);
+
+}
+
+
+// ============================================================================
+// CANCEL PENDING MEGA COMMANDS
+// ============================================================================
+
+void cancelPendingMegaCommands() {
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    megaPending[i].active =
+      false;
+
+    megaPending[i].retries =
+      0;
+
+    megaPending[i].partOfResync =
+      false;
+
+  }
+
+
+  fullMegaResyncActive =
+    false;
+
+}
+
+
+// ============================================================================
+// CLEAR COMMAND FAILURE
+// ============================================================================
+
+void clearCommandFailure(byte command) {
+
+  commandFailureLatched[command] =
+    false;
+
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    taFailureLatched =
+      false;
+
+  }
+
+}
+
+
+// ============================================================================
+// CLEAR ALL FAILURES
+// ============================================================================
+
+void clearAllCommandFailures() {
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    commandFailureLatched[i] =
+      false;
+
+  }
+
+
+  taFailureLatched =
+    false;
+
+  taFailedDesiredMode =
+    -2;
+
+}
+
+
+// ============================================================================
+// RESOLVE GIGA TRANSACTIONS
+// ============================================================================
+
+void resolveGigaTransactions() {
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    if (
+      !gigaTransactionPending[i]
+    ) {
+
+      continue;
+
+    }
+
+
+    // ----------------------------------------------------------------------
+    // MEGA LINK FAILURE
+    // ----------------------------------------------------------------------
+
+    if (!megaConnected) {
+
+      failGigaTransaction(
+        i,
+        "MEGA_LINK_LOST"
+      );
+
+      continue;
+
+    }
+
+
+    // ----------------------------------------------------------------------
+    // TA REQUESTS
+    //
+    // All TA source changes are reconciled when the effective desired
+    // TA mode matches the confirmed Mega TA mode.
+    //
+    // A GIGA TLEFT request can therefore be accepted while TRIGHT remains
+    // the active winner. STATE E/M remains authoritative for the UI.
+    //
+    // ----------------------------------------------------------------------
+
+    if (isTrafficAdvisorCommand(i)) {
+
+      if (
+        findDesiredTrafficAdvisor()
+        ==
+        confirmedTAMode
+      ) {
+
+        confirmGigaTransaction(i);
+
+      }
+
+
+      continue;
+
+    }
+
+
+    // ----------------------------------------------------------------------
+    // NORMAL COMMANDS
+    // ----------------------------------------------------------------------
+
+    if (
+      desiredDirectState(i)
+      ==
+      megaConfirmedState[i]
+    ) {
+
+      confirmGigaTransaction(i);
+
+    }
+
+  }
+
+}
+
+
+// ============================================================================
+// CONFIRM GIGA TRANSACTION
+// ============================================================================
+
+void confirmGigaTransaction(byte command) {
+
+  bool wasStart =
+    gigaTransactionWasStart[command];
+
+
+  gigaTransactionPending[command] =
+    false;
+
+
+  sendGigaConfirmed(
+    wasStart,
+    command
+  );
+
+}
+
+
+// ============================================================================
+// FAIL GIGA TRANSACTION
+// ============================================================================
+
+void failGigaTransaction(
+  byte command,
+  const char* reason
+) {
+
+  if (
+    !gigaTransactionPending[command]
+  ) {
+
+    return;
+
+  }
+
+
+  bool wasStart =
+    gigaTransactionWasStart[command];
+
+
+  gigaTransactionPending[command] =
+    false;
+
+
+  sendGigaFailed(
+    wasStart,
+    command,
+    reason
+  );
+
+}
+
+
+// ============================================================================
+// GIGA WATCHDOG
+// ============================================================================
+
+void updateGigaWatchdog() {
+
+  if (!gigaConnected) {
+
+    return;
+
+  }
+
+
+  if (
+    millis() - lastGigaHeartbeat
+    <
+    GIGA_TIMEOUT
+  ) {
+
+    return;
+
+  }
+
+
+  Serial.println(
+    "GIGA COMMUNICATION LOST"
+  );
+
+
+  gigaConnected =
+    false;
+
+
+  clearGigaRequests();
+
+}
+
+
+// ============================================================================
+// CLEAR GIGA REQUESTS
+// ============================================================================
+
+void clearGigaRequests() {
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    gigaRequest[i] =
+      false;
+
+    gigaTransactionPending[i] =
+      false;
+
+    gigaTAOrder[i] =
+      0;
+
+  }
+
+
+  // Physical requests remain completely untouched.
+
+  reconcileAll();
+
+}
+
+
+// ============================================================================
+// SEND STATE TO GIGA
+// ============================================================================
+//
+// P = physical source request
+// G = GIGA source request
+// E = effective desired Mega state
+// M = Mega confirmed state
+// H = startup physical hold
+//
+// Examples:
+//
+// Normal physical active:
+//
+// STATE OUTERS P=1 G=0 E=1 M=1 H=0
+//
+// Startup hold:
+//
+// STATE OUTERS P=1 G=0 E=0 M=0 H=1
+//
+// Physical + GIGA:
+//
+// STATE OUTERS P=1 G=1 E=1 M=1 H=0
+//
+// GIGA should give BLUE source precedence if P=1.
+//
+// ============================================================================
+
+void sendStateToGiga(byte command) {
+
+  if (!gigaConnected) {
+
+    return;
+
+  }
+
+
+  bool effective;
+  bool confirmed;
+
+
+  if (isTrafficAdvisorCommand(command)) {
+
+    effective =
+
+      findDesiredTrafficAdvisor()
+      ==
+      command;
+
+
+    confirmed =
+
+      confirmedTAMode
+      ==
+      command;
+
+  }
+
+  else {
+
+    effective =
+      desiredDirectState(command);
+
+    confirmed =
+      megaConfirmedState[command];
+
+  }
+
+
+  char message[140];
+
+  snprintf(
+    message,
+    sizeof(message),
+    "STATE %s P=%u G=%u E=%u M=%u H=%u",
+    commandNames[command],
+    physicalRequest[command] ? 1 : 0,
+    gigaRequest[command] ? 1 : 0,
+    effective ? 1 : 0,
+    confirmed ? 1 : 0,
+    startupPhysicalHold[command] ? 1 : 0
+  );
+
+
+  GigaSerial.println(message);
+
+}
+
+
+// ============================================================================
+// SEND ALL STATES
+// ============================================================================
+
+void sendAllStatesToGiga() {
+
+  if (!gigaConnected) {
+
+    return;
+
+  }
+
+
+  GigaSerial.println(
+    "SYNC_BEGIN"
+  );
+
+
+  for (byte i = 0; i < NUM_INPUTS; i++) {
+
+    sendStateToGiga(i);
+
+  }
+
+
+  GigaSerial.println(
+    "SYNC_END"
+  );
+
+}
+
+
+// ============================================================================
+// SEND ALL TA STATES
+// ============================================================================
+
+void sendAllTrafficAdvisorStates() {
+
+  sendStateToGiga(
+    CMD_TLEFT
+  );
+
+  sendStateToGiga(
+    CMD_TRIGHT
+  );
+
+  sendStateToGiga(
+    CMD_TOUT
+  );
+
+}
+
+
+// ============================================================================
+// NANO ACK TO GIGA
+// ============================================================================
+
+void sendGigaAck(
+  bool start,
+  byte command
+) {
+
+  if (!gigaConnected) {
+
+    return;
+
+  }
+
+
+  GigaSerial.print(
+    "ACK "
+  );
+
+  GigaSerial.print(
+    start
+    ?
+    "START"
+    :
+    "STOP"
+  );
+
+  GigaSerial.print(
+    " "
+  );
+
+  GigaSerial.println(
+    commandNames[command]
+  );
+
+}
+
+
+// ============================================================================
+// CONFIRMED TO GIGA
+// ============================================================================
+
+void sendGigaConfirmed(
+  bool start,
+  byte command
+) {
+
+  if (!gigaConnected) {
+
+    return;
+
+  }
+
+
+  GigaSerial.print(
+    "CONFIRMED "
+  );
+
+  GigaSerial.print(
+    start
+    ?
+    "START"
+    :
+    "STOP"
+  );
+
+  GigaSerial.print(
+    " "
+  );
+
+  GigaSerial.println(
+    commandNames[command]
+  );
+
+}
+
+
+// ============================================================================
+// FAILED TO GIGA
+// ============================================================================
+
+void sendGigaFailed(
+  bool start,
+  byte command,
+  const char* reason
+) {
+
+  if (!gigaConnected) {
+
+    return;
+
+  }
+
+
+  GigaSerial.print(
+    "FAILED "
+  );
+
+  GigaSerial.print(
+    start
+    ?
+    "START"
+    :
+    "STOP"
+  );
+
+  GigaSerial.print(
+    " "
+  );
+
+  GigaSerial.print(
+    commandNames[command]
+  );
+
+  GigaSerial.print(
+    " "
+  );
+
+  GigaSerial.println(
+    reason
+  );
+
+}
+
+
+// ============================================================================
+// DIAGNOSTIC FORWARDING TO GIGA
+// ============================================================================
+//
+// These messages let the GIGA serial monitor display Nano<->Mega activity
+// even though it is not physically connected to that UART.
+//
+// Example:
+//
+// DIAG N>M START OUTERS
+// DIAG M>N START OUTERS
+// DIAG N>M RETRY 1 START OUTERS
+// DIAG MEGA_NO_ACK START OUTERS
+//
+// ============================================================================
+
+void sendDiag(const char* text) {
+
+  Serial.print(
+    "DIAG: "
+  );
+
+  Serial.println(
+    text
+  );
+
+
+  if (!gigaConnected) {
+
+    return;
+
+  }
+
+
+  GigaSerial.print(
+    "DIAG "
+  );
+
+  GigaSerial.println(
+    text
+  );
+
+}
+
+
+// ============================================================================
+// DIAGNOSTIC COMMAND
+// ============================================================================
+
+void sendDiagCommand(
+  const char* direction,
+  const char* action,
+  byte command
+) {
+
+  char diag[120];
+
+  snprintf(
+    diag,
+    sizeof(diag),
+    "%s %s %s",
+    direction,
+    action,
+    commandNames[command]
+  );
+
+
+  sendDiag(diag);
+
+}
+
+
+// ============================================================================
+// SEND CURRENT MEGA LINK STATE TO GIGA
+// ============================================================================
+
+void sendMegaLinkStateToGiga() {
+
+  if (!gigaConnected) {
+
+    return;
+
+  }
+
+
+  if (megaConnected) {
+
+    GigaSerial.println(
+      "MEGA_LINK_RESTORED"
+    );
+
+  }
+
+  else {
+
+    GigaSerial.println(
+      "MEGA_LINK_LOST"
+    );
+
+  }
+
+}
