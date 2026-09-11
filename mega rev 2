@@ -1,74 +1,55 @@
 // ============================================================
 // CODE 3 MX7000 LIGHTBAR CONTROLLER
-// ARDUINO MEGA 2560
+// Arduino Mega 2560
 // ============================================================
 //
-// CURRENT BASELINE
-//
-// Mega 2560 = final lightbar output controller
+// Mega = final lightbar output controller.
 //
 // Responsibilities:
 //
-// - Receive commands from Nano ESP32 over Serial1
-// - Control Code 3 MX7000 outputs
+// - Receive commands from Nano ESP32
+// - Drive Code 3 MX7000 outputs
 // - Run Traffic Advisor patterns
-// - Give Traffic Advisor priority over turn signals
-// - Monitor Nano heartbeat
-// - Shut all outputs off if Nano heartbeat is lost
-// - ACK every valid START / STOP command
+// - Handle turn-signal / TA priority
+// - ACK every valid START / STOP
+// - Respond PONG to Nano PING
+// - Report boot / failsafe / recovery
+// - Report UART / protocol errors
+// - Shut everything OFF after 60 sec without Nano heartbeat
 //
-// IMPORTANT ACK DEFINITION:
+// IMPORTANT:
 //
-// A Mega ACK is treated by the rest of the system as:
+// Mega ACK is treated by the project as confirmation that the
+// requested Code 3 MX7000 function has been applied.
 //
-//      "The requested Code 3 MX7000 function is active/off
-//       as commanded."
-//
-// No additional lamp/current feedback sensors are used.
-//
-// Valid replies:
-//
-// ACK START OUTERS
-// ACK STOP OUTERS
-// ACK START TLEFT
-// etc.
-//
-// Duplicate START/STOP commands are ACKed too.
+// There are no additional lamp/current feedback sensors.
 //
 // ============================================================
-
 
 #include <Arduino.h>
 
 
 // ============================================================
-// SERIAL SETTINGS
+// SERIAL
 // ============================================================
 //
-// Mega Serial1:
+// Serial1:
 //
-// D18 = TX1 -> Nano D11 RX
-// D19 = RX1 <- Nano D10 TX
+// Mega D18 TX1 -> Nano D11 RX
+// Mega D19 RX1 <- Nano D10 TX
 //
 // IMPORTANT:
-//
-// Mega TX1 is 5V.
+// Mega TX is 5V.
 // Nano ESP32 RX is 3.3V.
 //
-// Use a level shifter or suitable voltage divider:
+// Use a level shifter or voltage divider on:
 //
-// Mega D18 TX1
-//      |
-//      v
-// level shift
-//      |
-//      v
-// Nano D11 RX
+// Mega D18 TX1 -> Nano D11 RX
 //
 // ============================================================
 
-const unsigned long NANO_BAUD = 38400;
 const unsigned long USB_BAUD  = 115200;
+const unsigned long NANO_BAUD = 38400;
 
 
 // ============================================================
@@ -96,25 +77,21 @@ const byte CMD_RIGHTSIGNAL     = 9;
 // ============================================================
 
 const char* commandNames[NUM_COMMANDS] = {
-
   "OUTERS",
   "INTERMEDIATES",
   "INNERS",
   "TRAFFICBREAKERS",
   "LEDS",
-
   "TLEFT",
   "TRIGHT",
   "TOUT",
-
   "LEFTSIGNAL",
   "RIGHTSIGNAL"
-
 };
 
 
 // ============================================================
-// TRAFFIC ADVISOR OUTPUT PINS
+// TRAFFIC ADVISOR OUTPUTS
 // ============================================================
 //
 // TA1 = far left
@@ -123,21 +100,19 @@ const char* commandNames[NUM_COMMANDS] = {
 // ============================================================
 
 const byte TA_PINS[8] = {
-
-  23,   // TA1 - far left
+  23,   // TA1
   25,   // TA2
   27,   // TA3
   29,   // TA4
   31,   // TA5
   33,   // TA6
   35,   // TA7
-  37    // TA8 - far right
-
+  37    // TA8
 };
 
 
 // ============================================================
-// DIRECT LIGHTBAR OUTPUT PINS
+// DIRECT OUTPUTS
 // ============================================================
 
 const byte PIN_TRAFFICBREAKERS = 39;
@@ -146,26 +121,20 @@ const byte PIN_INTERMEDIATES   = 43;
 const byte PIN_INNERS          = 45;
 const byte PIN_LEDS            = 47;
 
-
-// Reserved / currently unused:
-//
-// D49
-// D51
-// D53
+// D49 / D51 / D53 currently unused.
 
 
 // ============================================================
 // OUTPUT POLARITY
 // ============================================================
 //
-// Existing MX7000 interface behavior:
+// MX7000 control outputs are active LOW.
 //
-// LOW  = output ON
-// HIGH = output OFF
+// LOW  = ON
+// HIGH = OFF
 //
-// Arduino pins MUST NOT directly power lightbar loads.
-//
-// Use appropriate MOSFET / transistor / relay driver hardware.
+// Mega pins must drive suitable MOSFET / transistor / relay
+// interfaces. Do not power lightbar circuits directly.
 //
 // ============================================================
 
@@ -176,46 +145,44 @@ const byte OUTPUT_OFF = HIGH;
 // ============================================================
 // STATUS LED
 // ============================================================
-//
-// Uses Mega built-in LED.
-//
-// Startup / no heartbeat:
-//
-// OFF
-//
-// Nano heartbeat healthy (<6 seconds):
-//
-// SOLID ON
-//
-// Heartbeat delayed 6-60 seconds:
-//
-// FLASHING
-//
-// Heartbeat lost >=60 seconds:
-//
-// OFF + ALL LIGHTBAR OUTPUTS OFF
-//
-// ============================================================
 
 const byte STATUS_LED_PIN = LED_BUILTIN;
 
 const unsigned long STATUS_FLASH_INTERVAL = 500;
 
+unsigned long lastStatusFlash = 0;
+
+bool statusFlashState = false;
+
 
 // ============================================================
-// NANO HEARTBEAT WATCHDOG
+// HEARTBEAT WATCHDOG
+// ============================================================
+//
+// < 6 seconds:
+//
+// LED solid
+//
+// 6 - 60 seconds:
+//
+// LED flashes
+//
+// >= 60 seconds:
+//
+// LED OFF
+// all MX7000 outputs OFF
+// all remembered states cleared
+//
 // ============================================================
 
-const unsigned long HEARTBEAT_WARNING_TIME = 6000;
-const unsigned long HEARTBEAT_SHUTDOWN_TIME = 60000;
+const unsigned long HEARTBEAT_WARNING_TIME  = 6000UL;
+const unsigned long HEARTBEAT_SHUTDOWN_TIME = 60000UL;
 
 unsigned long lastNanoPing = 0;
 
 bool haveReceivedNanoPing = false;
-bool watchdogShutdown = false;
 
-unsigned long lastStatusFlash = 0;
-bool statusFlashState = false;
+bool watchdogShutdown = false;
 
 
 // ============================================================
@@ -232,35 +199,20 @@ bool ledsState           = false;
 // ============================================================
 // TURN SIGNAL STATES
 // ============================================================
-//
-// The actual blinking timing comes from the Nano's physical
-// turn-signal inputs.
-//
-// If LEFTSIGNAL is active:
-//
-// TA1 ON
-//
-// If RIGHTSIGNAL is active:
-//
-// TA8 ON
-//
-// If a Traffic Advisor mode is active, TA takes priority.
-//
-// ============================================================
 
 bool leftSignalState  = false;
 bool rightSignalState = false;
 
 
 // ============================================================
-// TRAFFIC ADVISOR STATE
+// TRAFFIC ADVISOR
 // ============================================================
 //
-// -1 = no TA mode
+// -1 = none
 //
-// 5 = TLEFT
-// 6 = TRIGHT
-// 7 = TOUT
+// CMD_TLEFT
+// CMD_TRIGHT
+// CMD_TOUT
 //
 // ============================================================
 
@@ -270,18 +222,14 @@ byte taStep = 0;
 
 unsigned long lastTAStepTime = 0;
 
-const unsigned long TA_STEP_INTERVAL = 500;
+const unsigned long TA_STEP_INTERVAL = 500UL;
 
 
 // ============================================================
-// NON-BLOCKING NANO SERIAL BUFFER
-// ============================================================
-//
-// Avoids readStringUntil() blocking the Mega.
-//
+// NON-BLOCKING SERIAL BUFFER
 // ============================================================
 
-const byte NANO_RX_BUFFER_SIZE = 64;
+const byte NANO_RX_BUFFER_SIZE = 80;
 
 char nanoRxBuffer[NANO_RX_BUFFER_SIZE];
 
@@ -293,37 +241,56 @@ byte nanoRxIndex = 0;
 // ============================================================
 
 void checkNanoSerial();
-void processNanoMessage(const char* message);
 
-void processStart(byte command);
-void processStop(byte command);
+void processNanoMessage(
+  const char* message
+);
+
+void processStart(
+  byte command
+);
+
+void processStop(
+  byte command
+);
 
 void sendAckToNano(
   const char* action,
   byte command
 );
 
-int findCommandIndex(
-  const char* command
+void sendNanoMessage(
+  const char* message
 );
 
-bool isTrafficAdvisorCommand(
-  byte command
+void sendErrorUnknownCommand(
+  const char* message
 );
 
 void updateHeartbeatWatchdog();
-void updateStatusLED();
+
+void enterFailsafe();
+
+void recoverFromFailsafe();
+
+void clearRememberedStates();
 
 void forceAllOutputsOff();
-void restoreOutputsAfterHeartbeat();
 
 void updateDirectOutputs();
 
 void updateTrafficAdvisor();
-void startTrafficAdvisor(byte command);
-void stopTrafficAdvisor(byte command);
+
+void startTrafficAdvisor(
+  byte command
+);
+
+void stopTrafficAdvisor(
+  byte command
+);
 
 void showCurrentTAStep();
+
 void clearTrafficAdvisorOutputs();
 
 void applyTurnSignalOutputs();
@@ -336,6 +303,12 @@ void setTAOutput(
 void setOutput(
   byte pin,
   bool state
+);
+
+void updateStatusLED();
+
+int findCommandIndex(
+  const char* command
 );
 
 
@@ -353,9 +326,9 @@ void setup() {
     USB_BAUD
   );
 
-
-  delay(500);
-
+  delay(
+    500
+  );
 
   Serial.println();
 
@@ -383,29 +356,6 @@ void setup() {
   );
 
 
-  Serial.println(
-    "Nano Serial1 started."
-  );
-
-  Serial.println(
-    "Mega D18 TX1 -> Nano D11 RX"
-  );
-
-  Serial.println(
-    "Mega D19 RX1 <- Nano D10 TX"
-  );
-
-  Serial.print(
-    "Baud: "
-  );
-
-  Serial.println(
-    NANO_BAUD
-  );
-
-  Serial.println();
-
-
   // ----------------------------------------------------------
   // STATUS LED
   // ----------------------------------------------------------
@@ -415,7 +365,6 @@ void setup() {
     OUTPUT
   );
 
-
   digitalWrite(
     STATUS_LED_PIN,
     LOW
@@ -423,7 +372,7 @@ void setup() {
 
 
   // ----------------------------------------------------------
-  // TRAFFIC ADVISOR OUTPUTS
+  // TA OUTPUTS
   // ----------------------------------------------------------
 
   for (
@@ -436,7 +385,6 @@ void setup() {
       TA_PINS[i],
       OUTPUT
     );
-
 
     digitalWrite(
       TA_PINS[i],
@@ -477,21 +425,39 @@ void setup() {
 
 
   // ----------------------------------------------------------
-  // FORCE SAFE STARTUP STATE
+  // SAFE STARTUP STATE
   // ----------------------------------------------------------
+
+  clearRememberedStates();
 
   forceAllOutputsOff();
 
 
   Serial.println(
-    "All Code 3 MX7000 outputs OFF."
+    "All MX7000 outputs OFF."
   );
 
   Serial.println(
-    "Waiting for Nano PING..."
+    "Waiting for Nano heartbeat."
   );
 
   Serial.println();
+
+
+  // ----------------------------------------------------------
+  // BOOT NOTIFICATION
+  // ----------------------------------------------------------
+  //
+  // If Nano is already online, this tells it that any previous
+  // Mega confirmation information is now invalid.
+  //
+  // Nano should clear its Mega-confirmed states and re-sync.
+  //
+  // ----------------------------------------------------------
+
+  sendNanoMessage(
+    "MEGA_BOOT"
+  );
 
 }
 
@@ -502,30 +468,11 @@ void setup() {
 
 void loop() {
 
-  // ----------------------------------------------------------
-  // PROCESS NANO UART
-  // ----------------------------------------------------------
-
   checkNanoSerial();
-
-
-  // ----------------------------------------------------------
-  // NANO HEARTBEAT WATCHDOG
-  // ----------------------------------------------------------
 
   updateHeartbeatWatchdog();
 
-
-  // ----------------------------------------------------------
-  // TRAFFIC ADVISOR ANIMATION
-  // ----------------------------------------------------------
-
   updateTrafficAdvisor();
-
-
-  // ----------------------------------------------------------
-  // STATUS LED
-  // ----------------------------------------------------------
 
   updateStatusLED();
 
@@ -533,7 +480,7 @@ void loop() {
 
 
 // ============================================================
-// NON-BLOCKING NANO SERIAL PARSER
+// NON-BLOCKING SERIAL RECEIVE
 // ============================================================
 
 void checkNanoSerial() {
@@ -546,9 +493,7 @@ void checkNanoSerial() {
       Serial1.read();
 
 
-    // --------------------------------------------------------
-    // IGNORE CARRIAGE RETURN
-    // --------------------------------------------------------
+    // Ignore CR
 
     if (
       c == '\r'
@@ -560,7 +505,7 @@ void checkNanoSerial() {
 
 
     // --------------------------------------------------------
-    // END OF MESSAGE
+    // COMPLETE MESSAGE
     // --------------------------------------------------------
 
     if (
@@ -588,11 +533,11 @@ void checkNanoSerial() {
           nanoRxBuffer
         );
 
-
-        nanoRxIndex =
-          0;
-
       }
+
+
+      nanoRxIndex =
+        0;
 
 
       continue;
@@ -601,7 +546,7 @@ void checkNanoSerial() {
 
 
     // --------------------------------------------------------
-    // STORE CHARACTER
+    // ADD CHARACTER
     // --------------------------------------------------------
 
     if (
@@ -613,25 +558,28 @@ void checkNanoSerial() {
       nanoRxBuffer[nanoRxIndex] =
         c;
 
-
       nanoRxIndex++;
 
     }
 
-
-    // --------------------------------------------------------
-    // BUFFER OVERFLOW
-    // --------------------------------------------------------
-
     else {
 
-      Serial.println(
-        "WARNING: Nano RX buffer overflow."
-      );
-
+      // ------------------------------------------------------
+      // RX BUFFER OVERFLOW
+      // ------------------------------------------------------
 
       nanoRxIndex =
         0;
+
+
+      Serial.println(
+        "ERROR: Nano RX buffer overflow"
+      );
+
+
+      sendNanoMessage(
+        "ERROR RX_OVERFLOW"
+      );
 
     }
 
@@ -641,16 +589,16 @@ void checkNanoSerial() {
 
 
 // ============================================================
-// PROCESS MESSAGE FROM NANO
+// PROCESS NANO MESSAGE
 // ============================================================
 
 void processNanoMessage(
   const char* message
 ) {
 
-  // ----------------------------------------------------------
-  // HEARTBEAT
-  // ----------------------------------------------------------
+  // ==========================================================
+  // PING
+  // ==========================================================
 
   if (
     strcmp(
@@ -661,7 +609,7 @@ void processNanoMessage(
     0
   ) {
 
-    bool recoveringFromShutdown =
+    bool recovering =
       watchdogShutdown;
 
 
@@ -673,33 +621,24 @@ void processNanoMessage(
       true;
 
 
-    watchdogShutdown =
-      false;
+    // --------------------------------------------------------
+    // ALWAYS REPLY PONG
+    // --------------------------------------------------------
 
-
-    Serial.println(
-      "Nano heartbeat received."
+    sendNanoMessage(
+      "PONG"
     );
 
 
     // --------------------------------------------------------
-    // RESTORE REQUESTED OUTPUT STATES AFTER WATCHDOG RECOVERY
+    // RECOVERY FROM FAILSAFE
     // --------------------------------------------------------
 
     if (
-      recoveringFromShutdown
+      recovering
     ) {
 
-      Serial.println(
-        "Nano communication restored."
-      );
-
-      Serial.println(
-        "Restoring requested MX7000 states."
-      );
-
-
-      restoreOutputsAfterHeartbeat();
+      recoverFromFailsafe();
 
     }
 
@@ -709,16 +648,17 @@ void processNanoMessage(
   }
 
 
-  // ----------------------------------------------------------
-  // DO NOT ACCEPT ACTIVE COMMANDS WITHOUT A VALID HEARTBEAT
+  // ==========================================================
+  // DO NOT ACCEPT COMMANDS UNTIL A VALID PING EXISTS
+  // ==========================================================
   //
-  // This is important because:
+  // Mega ACK is treated as confirmation that the requested
+  // lightbar state has actually been applied.
   //
-  // Mega ACK = lightbar active
+  // Therefore we do not issue START/STOP ACKs when the Nano
+  // link is considered inactive.
   //
-  // If watchdog shutdown is active, an ACK START would falsely
-  // tell the GIGA that a function is active.
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (
     !haveReceivedNanoPing
@@ -727,11 +667,16 @@ void processNanoMessage(
   ) {
 
     Serial.print(
-      "Command ignored - Nano heartbeat not active: "
+      "Command ignored while Nano link inactive: "
     );
 
     Serial.println(
       message
+    );
+
+
+    sendNanoMessage(
+      "ERROR LINK_INACTIVE"
     );
 
 
@@ -740,9 +685,9 @@ void processNanoMessage(
   }
 
 
-  // ----------------------------------------------------------
-  // START COMMAND
-  // ----------------------------------------------------------
+  // ==========================================================
+  // START
+  // ==========================================================
 
   if (
     strncmp(
@@ -765,36 +710,31 @@ void processNanoMessage(
 
 
     if (
-      command >= 0
+      command < 0
     ) {
 
-      processStart(
-        command
+      sendErrorUnknownCommand(
+        message
       );
 
-
-      // ------------------------------------------------------
-      // ACK ONLY AFTER COMMAND HAS BEEN APPLIED
-      // ------------------------------------------------------
-
-      sendAckToNano(
-        "START",
-        command
-      );
+      return;
 
     }
 
-    else {
 
-      Serial.print(
-        "Unknown START command: "
-      );
+    processStart(
+      command
+    );
 
-      Serial.println(
-        commandName
-      );
 
-    }
+    // --------------------------------------------------------
+    // ACK AFTER STATE HAS BEEN APPLIED
+    // --------------------------------------------------------
+
+    sendAckToNano(
+      "START",
+      command
+    );
 
 
     return;
@@ -802,9 +742,9 @@ void processNanoMessage(
   }
 
 
-  // ----------------------------------------------------------
-  // STOP COMMAND
-  // ----------------------------------------------------------
+  // ==========================================================
+  // STOP
+  // ==========================================================
 
   if (
     strncmp(
@@ -827,36 +767,31 @@ void processNanoMessage(
 
 
     if (
-      command >= 0
+      command < 0
     ) {
 
-      processStop(
-        command
+      sendErrorUnknownCommand(
+        message
       );
 
-
-      // ------------------------------------------------------
-      // ACK ONLY AFTER COMMAND HAS BEEN APPLIED
-      // ------------------------------------------------------
-
-      sendAckToNano(
-        "STOP",
-        command
-      );
+      return;
 
     }
 
-    else {
 
-      Serial.print(
-        "Unknown STOP command: "
-      );
+    processStop(
+      command
+    );
 
-      Serial.println(
-        commandName
-      );
 
-    }
+    // --------------------------------------------------------
+    // ACK AFTER STATE HAS BEEN APPLIED
+    // --------------------------------------------------------
+
+    sendAckToNano(
+      "STOP",
+      command
+    );
 
 
     return;
@@ -864,15 +799,11 @@ void processNanoMessage(
   }
 
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // UNKNOWN MESSAGE
-  // ----------------------------------------------------------
+  // ==========================================================
 
-  Serial.print(
-    "Unknown Nano message: "
-  );
-
-  Serial.println(
+  sendErrorUnknownCommand(
     message
   );
 
@@ -883,12 +814,16 @@ void processNanoMessage(
 // PROCESS START
 // ============================================================
 //
-// Duplicate START commands are intentionally safe.
+// Duplicate START commands are deliberately accepted and ACKed.
 //
-// Even if already active, the Mega processes the desired state
-// and returns another ACK.
+// This allows:
 //
-// This allows a lost ACK to be recovered by retry.
+// START OUTERS
+// ACK gets lost
+// START OUTERS retry
+// ACK START OUTERS
+//
+// without toggling the lightbar.
 //
 // ============================================================
 
@@ -899,7 +834,6 @@ void processStart(
   switch (
     command
   ) {
-
 
     // --------------------------------------------------------
     // DIRECT OUTPUTS
@@ -973,7 +907,7 @@ void processStart(
 
 
     // --------------------------------------------------------
-    // TURN SIGNALS
+    // LEFT SIGNAL
     // --------------------------------------------------------
 
     case CMD_LEFTSIGNAL:
@@ -992,6 +926,10 @@ void processStart(
 
       break;
 
+
+    // --------------------------------------------------------
+    // RIGHT SIGNAL
+    // --------------------------------------------------------
 
     case CMD_RIGHTSIGNAL:
 
@@ -1027,7 +965,7 @@ void processStart(
 // PROCESS STOP
 // ============================================================
 //
-// Duplicate STOP commands are also ACKed.
+// Duplicate STOP commands are also accepted and ACKed.
 //
 // ============================================================
 
@@ -1038,7 +976,6 @@ void processStop(
   switch (
     command
   ) {
-
 
     // --------------------------------------------------------
     // DIRECT OUTPUTS
@@ -1112,7 +1049,7 @@ void processStop(
 
 
     // --------------------------------------------------------
-    // TURN SIGNALS
+    // LEFT SIGNAL
     // --------------------------------------------------------
 
     case CMD_LEFTSIGNAL:
@@ -1131,6 +1068,10 @@ void processStop(
 
       break;
 
+
+    // --------------------------------------------------------
+    // RIGHT SIGNAL
+    // --------------------------------------------------------
 
     case CMD_RIGHTSIGNAL:
 
@@ -1163,7 +1104,7 @@ void processStop(
 
 
 // ============================================================
-// MEGA -> NANO ACK
+// SEND ACK
 // ============================================================
 //
 // Examples:
@@ -1171,9 +1112,6 @@ void processStop(
 // ACK START OUTERS
 // ACK STOP OUTERS
 // ACK START TLEFT
-//
-// The project treats this ACK as confirmation that the
-// corresponding Code 3 MX7000 state has been applied.
 //
 // ============================================================
 
@@ -1214,6 +1152,325 @@ void sendAckToNano(
   Serial.println(
     commandNames[command]
   );
+
+}
+
+
+// ============================================================
+// SEND GENERIC MESSAGE TO NANO
+// ============================================================
+
+void sendNanoMessage(
+  const char* message
+) {
+
+  Serial1.println(
+    message
+  );
+
+
+  Serial.print(
+    "MEGA -> NANO: "
+  );
+
+  Serial.println(
+    message
+  );
+
+}
+
+
+// ============================================================
+// UNKNOWN COMMAND ERROR
+// ============================================================
+
+void sendErrorUnknownCommand(
+  const char* message
+) {
+
+  Serial.print(
+    "UNKNOWN COMMAND: "
+  );
+
+  Serial.println(
+    message
+  );
+
+
+  Serial1.print(
+    "ERROR UNKNOWN_COMMAND "
+  );
+
+  Serial1.println(
+    message
+  );
+
+
+  Serial.print(
+    "MEGA -> NANO: ERROR UNKNOWN_COMMAND "
+  );
+
+  Serial.println(
+    message
+  );
+
+}
+
+
+// ============================================================
+// HEARTBEAT WATCHDOG
+// ============================================================
+
+void updateHeartbeatWatchdog() {
+
+  if (
+    !haveReceivedNanoPing
+  ) {
+
+    return;
+
+  }
+
+
+  unsigned long elapsed =
+
+    millis()
+    -
+    lastNanoPing;
+
+
+  if (
+    elapsed
+    >=
+    HEARTBEAT_SHUTDOWN_TIME
+  ) {
+
+    if (
+      !watchdogShutdown
+    ) {
+
+      enterFailsafe();
+
+    }
+
+  }
+
+}
+
+
+// ============================================================
+// ENTER FAILSAFE
+// ============================================================
+//
+// IMPORTANT:
+//
+// Unlike the previous version, the Mega DOES NOT remember its
+// requested output states.
+//
+// Everything is cleared.
+//
+// When communication returns, the Nano becomes responsible for
+// deciding what should be active and resending those commands.
+//
+// ============================================================
+
+void enterFailsafe() {
+
+  watchdogShutdown =
+    true;
+
+
+  Serial.println();
+
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println(
+    " MEGA FAILSAFE"
+  );
+
+  Serial.println(
+    " Nano heartbeat lost for 60 seconds"
+  );
+
+  Serial.println(
+    " All MX7000 states cleared"
+  );
+
+  Serial.println(
+    " All MX7000 outputs OFF"
+  );
+
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println();
+
+
+  // ----------------------------------------------------------
+  // SEND DIAGNOSTIC
+  // ----------------------------------------------------------
+
+  sendNanoMessage(
+    "MEGA_FAILSAFE"
+  );
+
+
+  // ----------------------------------------------------------
+  // CLEAR ALL REMEMBERED STATES
+  // ----------------------------------------------------------
+
+  clearRememberedStates();
+
+
+  // ----------------------------------------------------------
+  // FORCE PHYSICAL OUTPUTS OFF
+  // ----------------------------------------------------------
+
+  forceAllOutputsOff();
+
+}
+
+
+// ============================================================
+// RECOVER FROM FAILSAFE
+// ============================================================
+//
+// No old states are restored.
+//
+// Nano must explicitly resend the desired system state.
+//
+// ============================================================
+
+void recoverFromFailsafe() {
+
+  watchdogShutdown =
+    false;
+
+
+  Serial.println();
+
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println(
+    " MEGA COMMUNICATION RECOVERED"
+  );
+
+  Serial.println(
+    " Waiting for Nano state resynchronization"
+  );
+
+  Serial.println(
+    "=========================================="
+  );
+
+  Serial.println();
+
+
+  sendNanoMessage(
+    "MEGA_RECOVERED"
+  );
+
+
+  // ----------------------------------------------------------
+  // KEEP EVERYTHING OFF
+  //
+  // Nano must explicitly resend START commands.
+  // ----------------------------------------------------------
+
+  clearRememberedStates();
+
+  forceAllOutputsOff();
+
+}
+
+
+// ============================================================
+// CLEAR ALL REMEMBERED STATES
+// ============================================================
+
+void clearRememberedStates() {
+
+  outerState =
+    false;
+
+  intermediateState =
+    false;
+
+  innerState =
+    false;
+
+  trafficBreakerState =
+    false;
+
+  ledsState =
+    false;
+
+
+  leftSignalState =
+    false;
+
+  rightSignalState =
+    false;
+
+
+  currentTAMode =
+    -1;
+
+  taStep =
+    0;
+
+}
+
+
+// ============================================================
+// FORCE ALL OUTPUT PINS OFF
+// ============================================================
+
+void forceAllOutputsOff() {
+
+  digitalWrite(
+    PIN_OUTERS,
+    OUTPUT_OFF
+  );
+
+  digitalWrite(
+    PIN_INTERMEDIATES,
+    OUTPUT_OFF
+  );
+
+  digitalWrite(
+    PIN_INNERS,
+    OUTPUT_OFF
+  );
+
+  digitalWrite(
+    PIN_TRAFFICBREAKERS,
+    OUTPUT_OFF
+  );
+
+  digitalWrite(
+    PIN_LEDS,
+    OUTPUT_OFF
+  );
+
+
+  for (
+    byte i = 0;
+    i < 8;
+    i++
+  ) {
+
+    digitalWrite(
+      TA_PINS[i],
+      OUTPUT_OFF
+    );
+
+  }
 
 }
 
@@ -1285,12 +1542,12 @@ void startTrafficAdvisor(
     millis();
 
 
-  // TA has priority over turn signals.
+  // TA overrides turn signals.
 
   clearTrafficAdvisorOutputs();
 
 
-  // Show first TA frame immediately.
+  // First frame appears immediately.
 
   showCurrentTAStep();
 
@@ -1306,10 +1563,8 @@ void stopTrafficAdvisor(
 ) {
 
   // ----------------------------------------------------------
-  // ONLY STOP IT IF THIS IS THE CURRENT TA MODE
-  //
-  // A stale STOP for another mode must not kill the currently
-  // running mode.
+  // A stale STOP for a TA mode that is no longer running must
+  // not kill another active TA mode.
   // ----------------------------------------------------------
 
   if (
@@ -1330,7 +1585,7 @@ void stopTrafficAdvisor(
   clearTrafficAdvisorOutputs();
 
 
-  // Restore turn signals immediately.
+  // Restore turn signal state immediately.
 
   applyTurnSignalOutputs();
 
@@ -1366,12 +1621,9 @@ void updateTrafficAdvisor() {
 
 
   if (
-
     now - lastTAStepTime
-
     <
     TA_STEP_INTERVAL
-
   ) {
 
     return;
@@ -1384,7 +1636,7 @@ void updateTrafficAdvisor() {
 
 
   // ----------------------------------------------------------
-  // ADVANCE STEP
+  // CENTER OUT HAS 4 STEPS
   // ----------------------------------------------------------
 
   if (
@@ -1406,6 +1658,10 @@ void updateTrafficAdvisor() {
     }
 
   }
+
+  // ----------------------------------------------------------
+  // LEFT / RIGHT HAVE 7 STEPS
+  // ----------------------------------------------------------
 
   else {
 
@@ -1430,7 +1686,7 @@ void updateTrafficAdvisor() {
 
 
 // ============================================================
-// DISPLAY CURRENT TRAFFIC ADVISOR STEP
+// TRAFFIC ADVISOR FRAME
 // ============================================================
 
 void showCurrentTAStep() {
@@ -1447,7 +1703,7 @@ void showCurrentTAStep() {
   clearTrafficAdvisorOutputs();
 
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // LEFT
   //
   // 1+2
@@ -1457,7 +1713,7 @@ void showCurrentTAStep() {
   // 5+6
   // 6+7
   // 7+8
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (
     currentTAMode
@@ -1482,7 +1738,7 @@ void showCurrentTAStep() {
   }
 
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // RIGHT
   //
   // 8+7
@@ -1492,7 +1748,7 @@ void showCurrentTAStep() {
   // 4+3
   // 3+2
   // 2+1
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (
     currentTAMode
@@ -1502,7 +1758,6 @@ void showCurrentTAStep() {
 
     byte first =
       7 - taStep;
-
 
     byte second =
       6 - taStep;
@@ -1525,14 +1780,14 @@ void showCurrentTAStep() {
   }
 
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // CENTER OUT
   //
   // TA4 + TA5
   // TA3 + TA6
   // TA2 + TA7
   // TA1 + TA8
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (
     currentTAMode
@@ -1614,14 +1869,12 @@ void showCurrentTAStep() {
 // TURN SIGNAL OUTPUTS
 // ============================================================
 //
-// Traffic Advisor always has priority.
+// TA always has priority.
 //
 // Without TA:
 //
 // LEFTSIGNAL  -> TA1
 // RIGHTSIGNAL -> TA8
-//
-// Both may be active simultaneously.
 //
 // ============================================================
 
@@ -1663,7 +1916,7 @@ void applyTurnSignalOutputs() {
 
 
 // ============================================================
-// CLEAR ALL TRAFFIC ADVISOR OUTPUTS
+// CLEAR ALL TA OUTPUTS
 // ============================================================
 
 void clearTrafficAdvisorOutputs() {
@@ -1685,7 +1938,7 @@ void clearTrafficAdvisorOutputs() {
 
 
 // ============================================================
-// SET TRAFFIC ADVISOR OUTPUT
+// SET TA OUTPUT
 // ============================================================
 
 void setTAOutput(
@@ -1720,7 +1973,6 @@ void setOutput(
 ) {
 
   digitalWrite(
-
     pin,
 
     state
@@ -1728,86 +1980,7 @@ void setOutput(
     OUTPUT_ON
     :
     OUTPUT_OFF
-
   );
-
-}
-
-
-// ============================================================
-// HEARTBEAT WATCHDOG
-// ============================================================
-
-void updateHeartbeatWatchdog() {
-
-  if (
-    !haveReceivedNanoPing
-  ) {
-
-    return;
-
-  }
-
-
-  unsigned long elapsed =
-
-    millis()
-    -
-    lastNanoPing;
-
-
-  // ----------------------------------------------------------
-  // 60+ SECONDS
-  //
-  // SHUT EVERYTHING DOWN
-  // ----------------------------------------------------------
-
-  if (
-
-    elapsed
-    >=
-    HEARTBEAT_SHUTDOWN_TIME
-
-  ) {
-
-    if (
-      !watchdogShutdown
-    ) {
-
-      watchdogShutdown =
-        true;
-
-
-      Serial.println();
-
-      Serial.println(
-        "======================================"
-      );
-
-      Serial.println(
-        " WARNING: NANO HEARTBEAT LOST"
-      );
-
-      Serial.println(
-        " ALL CODE 3 MX7000 OUTPUTS OFF"
-      );
-
-      Serial.println(
-        " Mega ACKs suspended until new PING"
-      );
-
-      Serial.println(
-        "======================================"
-      );
-
-      Serial.println();
-
-
-      forceAllOutputsOff();
-
-    }
-
-  }
 
 }
 
@@ -1819,7 +1992,7 @@ void updateHeartbeatWatchdog() {
 void updateStatusLED() {
 
   // ----------------------------------------------------------
-  // NO PING EVER RECEIVED
+  // NEVER RECEIVED A PING
   // ----------------------------------------------------------
 
   if (
@@ -1830,7 +2003,6 @@ void updateStatusLED() {
       STATUS_LED_PIN,
       LOW
     );
-
 
     return;
 
@@ -1845,15 +2017,13 @@ void updateStatusLED() {
 
 
   // ----------------------------------------------------------
-  // 60+ SECONDS
+  // FAILSAFE
   // ----------------------------------------------------------
 
   if (
-
     elapsed
     >=
     HEARTBEAT_SHUTDOWN_TIME
-
   ) {
 
     digitalWrite(
@@ -1861,22 +2031,19 @@ void updateStatusLED() {
       LOW
     );
 
-
     return;
 
   }
 
 
   // ----------------------------------------------------------
-  // 6 - 60 SECONDS
+  // WARNING / FLASHING
   // ----------------------------------------------------------
 
   if (
-
     elapsed
     >=
     HEARTBEAT_WARNING_TIME
-
   ) {
 
     unsigned long now =
@@ -1884,13 +2051,9 @@ void updateStatusLED() {
 
 
     if (
-
       now - lastStatusFlash
-
       >=
-
       STATUS_FLASH_INTERVAL
-
     ) {
 
       lastStatusFlash =
@@ -1902,7 +2065,6 @@ void updateStatusLED() {
 
 
       digitalWrite(
-
         STATUS_LED_PIN,
 
         statusFlashState
@@ -1910,7 +2072,6 @@ void updateStatusLED() {
         HIGH
         :
         LOW
-
       );
 
     }
@@ -1938,100 +2099,7 @@ void updateStatusLED() {
 
 
 // ============================================================
-// FORCE ALL OUTPUTS OFF
-// ============================================================
-//
-// This does NOT erase requested states.
-//
-// That allows requested output state to be restored if the
-// Nano heartbeat returns.
-//
-// ============================================================
-
-void forceAllOutputsOff() {
-
-  digitalWrite(
-    PIN_OUTERS,
-    OUTPUT_OFF
-  );
-
-
-  digitalWrite(
-    PIN_INTERMEDIATES,
-    OUTPUT_OFF
-  );
-
-
-  digitalWrite(
-    PIN_INNERS,
-    OUTPUT_OFF
-  );
-
-
-  digitalWrite(
-    PIN_TRAFFICBREAKERS,
-    OUTPUT_OFF
-  );
-
-
-  digitalWrite(
-    PIN_LEDS,
-    OUTPUT_OFF
-  );
-
-
-  for (
-    byte i = 0;
-    i < 8;
-    i++
-  ) {
-
-    digitalWrite(
-      TA_PINS[i],
-      OUTPUT_OFF
-    );
-
-  }
-
-}
-
-
-// ============================================================
-// RESTORE OUTPUTS AFTER HEARTBEAT RECOVERY
-// ============================================================
-
-void restoreOutputsAfterHeartbeat() {
-
-  updateDirectOutputs();
-
-
-  if (
-    currentTAMode >= 0
-  ) {
-
-    taStep =
-      0;
-
-
-    lastTAStepTime =
-      millis();
-
-
-    showCurrentTAStep();
-
-  }
-
-  else {
-
-    applyTurnSignalOutputs();
-
-  }
-
-}
-
-
-// ============================================================
-// FIND COMMAND INDEX
+// FIND COMMAND
 // ============================================================
 
 int findCommandIndex(
@@ -2045,14 +2113,12 @@ int findCommandIndex(
   ) {
 
     if (
-
       strcasecmp(
         command,
         commandNames[i]
       )
       ==
       0
-
     ) {
 
       return i;
@@ -2063,30 +2129,5 @@ int findCommandIndex(
 
 
   return -1;
-
-}
-
-
-// ============================================================
-// TRAFFIC ADVISOR COMMAND CHECK
-// ============================================================
-
-bool isTrafficAdvisorCommand(
-  byte command
-) {
-
-  return (
-
-    command == CMD_TLEFT
-
-    ||
-
-    command == CMD_TRIGHT
-
-    ||
-
-    command == CMD_TOUT
-
-  );
 
 }
