@@ -11,6 +11,20 @@
   GIGA GND    -> Nano GND
   Baud: 38400
 
+  ============================================================
+  STARTUP
+  ============================================================
+
+  Displays DBB startup logo for 5 seconds.
+
+  The startup screen is NON-BLOCKING.
+  GIGA <-> Nano communications continue during startup.
+
+  Logo:
+      480 x 480
+      centered on 800 x 480 display
+      X = 160
+      Y = 0
 
   ============================================================
   TOUCH BEHAVIOR
@@ -21,7 +35,7 @@
       Finger down
           |
           v
-      Button is remembered
+      Button remembered
           |
           v
       NO COMMAND SENT
@@ -30,7 +44,7 @@
       Finger released
           |
           v
-      100ms continuous no-touch
+      100 ms continuous no-touch
           |
           v
       Command sent ONCE
@@ -44,49 +58,19 @@
       Hold >= 2 seconds
           |
           v
-      Mark as LONG PRESS
+      Classified as LONG PRESS
           |
           v
-      NO COMMAND SENT YET
+      NO COMMAND SENT
           |
           v
       Finger released
           |
           v
-      100ms continuous no-touch
+      100 ms continuous no-touch
           |
           v
       Override command sent ONCE
-
-
-  Short 4-5ms touch-controller dropouts are ignored.
-
-
-  ============================================================
-  BUTTON COLORS
-  ============================================================
-
-  DARK
-    Inactive
-
-  BLUE
-    Physical switch active
-
-  FLASHING BLUE
-    Physical switch active during startup hold
-
-  RED
-    Physical switch active but overridden by GIGA
-
-  FLASHING PURPLE
-    Waiting for final START/STOP confirmation
-
-  SOLID PURPLE
-    Confirmation timeout
-
-  GREEN
-    GIGA request active and Mega confirmed
-
 
   ============================================================
 */
@@ -98,6 +82,8 @@
 #include <math.h>
 #include <string.h>
 #include <strings.h>
+
+#include "dbb_startup_logo.h"
 
 
 // ============================================================
@@ -131,6 +117,17 @@ const uint16_t COLOR_BUTTON_IDLE = 0x1082;
 
 const uint16_t COLOR_OBS_GREEN = 0x87F0;
 const uint16_t COLOR_GREEN     = COLOR_OBS_GREEN;
+
+
+// ============================================================
+// STARTUP SPLASH
+// ============================================================
+
+const unsigned long STARTUP_SPLASH_TIME = 5000;
+
+bool startupSplashActive = true;
+
+unsigned long startupSplashStartedAt = 0;
 
 
 // ============================================================
@@ -220,8 +217,7 @@ LightbarState lightbar[NUM_COMMANDS];
 // ============================================================
 
 const unsigned long COMMAND_RETRY_INTERVAL = 5000;
-
-const unsigned long COMMAND_TOTAL_TIMEOUT = 30000;
+const unsigned long COMMAND_TOTAL_TIMEOUT  = 30000;
 
 
 // ============================================================
@@ -232,7 +228,7 @@ const unsigned long OVERRIDE_HOLD_TIME = 2000;
 
 
 // ============================================================
-// NEW - CONFIRMED BUTTON RELEASE
+// CONFIRMED BUTTON RELEASE
 // ============================================================
 
 const unsigned long BUTTON_RELEASE_CONFIRM_TIME = 100;
@@ -245,13 +241,11 @@ const unsigned long BUTTON_RELEASE_CONFIRM_TIME = 100;
 const unsigned long HEARTBEAT_INTERVAL = 5000;
 
 const unsigned long NANO_TIMEOUT = 30000;
-
 const unsigned long MEGA_TIMEOUT = 30000;
 
 unsigned long lastHeartbeatSent = 0;
 
 unsigned long lastNanoResponse = 0;
-
 unsigned long lastMegaResponse = 0;
 
 
@@ -323,7 +317,6 @@ unsigned long lastGaugeUpdate = 0;
 const float GAUGE_SMOOTHING = 0.15;
 
 const float IPR_DEADBAND = 0.15;
-
 const float ICP_DEADBAND = 5.0;
 
 float displayedIPR = 0;
@@ -376,20 +369,7 @@ int lightbarPressedCommand = -1;
 
 unsigned long lightbarPressStartedAt = 0;
 
-
-// ------------------------------------------------------------
-// A long press is now only CLASSIFIED while finger is down.
-// It is not executed until confirmed release.
-// ------------------------------------------------------------
-
 bool lightbarLongPressDetected = false;
-
-
-// ------------------------------------------------------------
-// Potential release timer.
-//
-// A momentary contacts==0 does NOT immediately end the press.
-// ------------------------------------------------------------
 
 bool lightbarReleasePending = false;
 
@@ -417,9 +397,7 @@ const int SECRET_START_RAW_X_MAX = 380;
 const int SECRET_MIN_FINGER_SEPARATION = 100;
 
 bool secretGestureTracking = false;
-
 bool secretGestureTriggered = false;
-
 bool secretGestureLocked = false;
 
 float secretStartRawX = 0;
@@ -473,6 +451,8 @@ byte nanoRxIndex = 0;
 // ============================================================
 // PROTOTYPES
 // ============================================================
+
+void drawStartupSplash();
 
 void drawGaugeScreen();
 void drawGaugeStatic();
@@ -643,15 +623,11 @@ void setup() {
   ) {
 
     lightbar[i].physical = false;
-
     lightbar[i].giga = false;
-
     lightbar[i].effective = false;
-
     lightbar[i].megaConfirmed = false;
 
     lightbar[i].startupHold = false;
-
     lightbar[i].overrideActive = false;
 
     lightbar[i].failed = false;
@@ -663,7 +639,6 @@ void setup() {
     lightbar[i].pendingStart = false;
 
     lightbar[i].commandSentAt = 0;
-
     lightbar[i].commandStartedAt = 0;
 
     lightbar[i].waitingForConfirmation = false;
@@ -677,8 +652,18 @@ void setup() {
   displayedICP = 0;
 
 
-  drawGaugeScreen();
+  // ==========================================================
+  // STARTUP LOGO
+  // ==========================================================
 
+  drawStartupSplash();
+
+
+  // ==========================================================
+  // START COMMUNICATION IMMEDIATELY
+  //
+  // Communications operate while splash screen is displayed.
+  // ==========================================================
 
   NanoSerial.println(
     "GIGA_PING"
@@ -706,11 +691,46 @@ void loop() {
     millis();
 
 
+  // ==========================================================
+  // COMMUNICATION ALWAYS RUNS
+  // ==========================================================
+
   handleNanoSerial();
 
   sendHeartbeat();
 
   retryPendingCommands();
+
+
+  // ==========================================================
+  // STARTUP SPLASH
+  //
+  // Do not process normal UI until splash timer expires.
+  // Communications above continue normally.
+  // ==========================================================
+
+  if (
+    startupSplashActive
+  ) {
+
+    if (
+      now -
+      startupSplashStartedAt >=
+      STARTUP_SPLASH_TIME
+    ) {
+
+      startupSplashActive =
+        false;
+
+
+      drawGaugeScreen();
+
+    } else {
+
+      return;
+    }
+  }
+
 
   handleTouch();
 
@@ -826,6 +846,50 @@ void loop() {
 
 
   updateAlarmBorder();
+}
+
+
+// ============================================================
+// STARTUP SPLASH
+// ============================================================
+
+void drawStartupSplash() {
+
+  display.fillScreen(
+    COLOR_BLACK
+  );
+
+
+  // ----------------------------------------------------------
+  // Original logo is square.
+  //
+  // Display = 800 x 480
+  // Logo    = 480 x 480
+  //
+  // X:
+  // (800 - 480) / 2 = 160
+  //
+  // Y:
+  // 0
+  //
+  // This gives us the largest possible uncropped image.
+  // ----------------------------------------------------------
+
+  display.drawRGBBitmap(
+    160,
+    0,
+    dbbStartupLogo,
+    DBB_LOGO_WIDTH,
+    DBB_LOGO_HEIGHT
+  );
+
+
+  startupSplashStartedAt =
+    millis();
+
+
+  startupSplashActive =
+    true;
 }
 
 
@@ -1027,6 +1091,7 @@ void drawGaugeStatic() {
 
 
   display.setTextSize(2);
+
 
   display.setCursor(
     18,
@@ -1684,12 +1749,9 @@ void handleTouch() {
     }
 
 
-    // ========================================================
-    // NO TOUCH
-    //
-    // IMPORTANT:
-    // DO NOT immediately execute button.
-    // ========================================================
+    // --------------------------------------------------------
+    // Zero contacts begins/continues POSSIBLE release.
+    // --------------------------------------------------------
 
     if (
       contacts == 0
@@ -1707,12 +1769,11 @@ void handleTouch() {
     }
 
 
-    // ========================================================
-    // TOUCH RETURNED
+    // --------------------------------------------------------
+    // Touch came back before release confirmation.
     //
-    // If we were timing a possible release and touch came back
-    // before 100ms, it was only a touchscreen dropout.
-    // ========================================================
+    // Therefore the zero-contact period was just a dropout.
+    // --------------------------------------------------------
 
     if (
       lightbarReleasePending
@@ -1738,9 +1799,9 @@ void handleTouch() {
     );
 
 
-    // ========================================================
-    // BEGIN NEW PRESS
-    // ========================================================
+    // --------------------------------------------------------
+    // Begin new press.
+    // --------------------------------------------------------
 
     if (
       !lightbarPressActive
@@ -1756,9 +1817,9 @@ void handleTouch() {
     }
 
 
-    // ========================================================
-    // CONTINUE EXISTING PRESS
-    // ========================================================
+    // --------------------------------------------------------
+    // Continue current press.
+    // --------------------------------------------------------
 
     updateLightbarPress(
       contacts,
@@ -1902,9 +1963,9 @@ void handleLightbarPress(
 
 
   // ==========================================================
-  // RECORD PRESS
+  // RECORD PRESS ONLY
   //
-  // NO COMMAND IS SENT HERE.
+  // Nothing is transmitted here.
   // ==========================================================
 
   lightbarPressActive =
@@ -1962,9 +2023,8 @@ void updateLightbarPress(
 
 
   // ----------------------------------------------------------
-  // Finger moved completely outside original button.
-  //
-  // Cancel the press.
+  // Finger moved outside the original button.
+  // Cancel without sending anything.
   // ----------------------------------------------------------
 
   if (
@@ -1990,11 +2050,6 @@ void updateLightbarPress(
   }
 
 
-  // ----------------------------------------------------------
-  // Already classified as long press.
-  // Just wait for release.
-  // ----------------------------------------------------------
-
   if (
     lightbarLongPressDetected
   ) {
@@ -2019,14 +2074,11 @@ void updateLightbarPress(
     ];
 
 
-  // ==========================================================
-  // LONG PRESS CLASSIFICATION
+  // ----------------------------------------------------------
+  // Classify as long press.
   //
-  // IMPORTANT:
-  // WE DO NOT EXECUTE OVERRIDE HERE.
-  //
-  // We merely remember that this became a long press.
-  // ==========================================================
+  // DO NOT send override yet.
+  // ----------------------------------------------------------
 
   if (
     s.physical
@@ -2039,7 +2091,7 @@ void updateLightbarPress(
 
 
 // ============================================================
-// PROCESS POSSIBLE RELEASE
+// POSSIBLE RELEASE
 // ============================================================
 
 void processLightbarRelease() {
@@ -2056,11 +2108,9 @@ void processLightbarRelease() {
     millis();
 
 
-  // ==========================================================
-  // FIRST ZERO-CONTACT SAMPLE
-  //
-  // Start release timer.
-  // ==========================================================
+  // ----------------------------------------------------------
+  // First zero-contact sample.
+  // ----------------------------------------------------------
 
   if (
     !lightbarReleasePending
@@ -2078,9 +2128,9 @@ void processLightbarRelease() {
   }
 
 
-  // ==========================================================
-  // NOT ZERO LONG ENOUGH YET
-  // ==========================================================
+  // ----------------------------------------------------------
+  // Require continuous zero contacts for 100 ms.
+  // ----------------------------------------------------------
 
   if (
     now -
@@ -2092,11 +2142,9 @@ void processLightbarRelease() {
   }
 
 
-  // ==========================================================
-  // REAL RELEASE CONFIRMED
-  //
-  // This is the ONLY place the press is committed.
-  // ==========================================================
+  // ----------------------------------------------------------
+  // Genuine release.
+  // ----------------------------------------------------------
 
   finishLightbarPress();
 }
@@ -2116,10 +2164,6 @@ void finishLightbarPress() {
   }
 
 
-  // ----------------------------------------------------------
-  // Copy everything BEFORE resetting press state.
-  // ----------------------------------------------------------
-
   int column =
     lightbarPressedColumn;
 
@@ -2137,9 +2181,9 @@ void finishLightbarPress() {
 
 
   // ----------------------------------------------------------
-  // Clear press FIRST.
+  // Clear touch state BEFORE executing.
   //
-  // This guarantees this physical touch can only commit once.
+  // This guarantees this touch can commit only once.
   // ----------------------------------------------------------
 
   cancelLightbarPress();
@@ -2168,9 +2212,10 @@ void finishLightbarPress() {
 
 
   // ==========================================================
-  // SHORT PRESS ON PHYSICAL-ACTIVE BUTTON
+  // SHORT PRESS WHILE PHYSICAL SWITCH ACTIVE
   //
-  // Physical buttons require long hold to override.
+  // Do nothing.
+  // Physical source is changed only with long hold override.
   // ==========================================================
 
   if (
@@ -2185,7 +2230,7 @@ void finishLightbarPress() {
 
 
   // ==========================================================
-  // NORMAL SHORT TAP
+  // NORMAL TAP
   // ==========================================================
 
   executeLightbarShortPress(
@@ -2245,10 +2290,6 @@ void executeLightbarShortPress(
   int command
 ) {
 
-  // ==========================================================
-  // TOP ROW
-  // ==========================================================
-
   if (
     row == 0
   ) {
@@ -2269,10 +2310,6 @@ void executeLightbarShortPress(
     return;
   }
 
-
-  // ==========================================================
-  // BOTTOM ROW
-  // ==========================================================
 
   switch (
     column
@@ -3559,7 +3596,7 @@ void processNanoLine(
 
 
   // ==========================================================
-  // PONG
+  // GIGA PONG
   // ==========================================================
 
   if (
@@ -3819,7 +3856,8 @@ void processNanoLine(
   // ==========================================================
   // NORMAL CONFIRMED
   //
-  // STALE CONFIRMATION PROTECTION
+  // Opposite/stale confirmations cannot complete the current
+  // transaction.
   // ==========================================================
 
   if (
@@ -3873,11 +3911,6 @@ void processNanoLine(
       ) == 0;
 
 
-    // --------------------------------------------------------
-    // No current transaction:
-    // old confirmation cannot alter GIGA state.
-    // --------------------------------------------------------
-
     if (
       !s.waitingForConfirmation
     ) {
@@ -3905,11 +3938,6 @@ void processNanoLine(
       return;
     }
 
-
-    // --------------------------------------------------------
-    // Opposite confirmation:
-    // ignore it and continue waiting.
-    // --------------------------------------------------------
 
     if (
       confirmedStart !=
@@ -3939,10 +3967,6 @@ void processNanoLine(
       return;
     }
 
-
-    // --------------------------------------------------------
-    // Correct confirmation.
-    // --------------------------------------------------------
 
     s.megaConfirmed =
       confirmedStart;
@@ -3984,7 +4008,7 @@ void processNanoLine(
   // ==========================================================
   // FAILED
   //
-  // Does NOT end 30-second retry cycle.
+  // Does not terminate 30-second retry cycle.
   // ==========================================================
 
   if (
@@ -4082,7 +4106,9 @@ void processNanoLine(
   // ==========================================================
   // STATE
   //
-  // STATE updates truth but DOES NOT finish pending command.
+  // STATE updates known truth.
+  //
+  // It DOES NOT cancel a pending GIGA transaction.
   // ==========================================================
 
   if (
@@ -4189,11 +4215,6 @@ void processNanoLine(
       s.overrideActive =
         false;
     }
-
-
-    // IMPORTANT:
-    //
-    // waitingForConfirmation is NOT changed here.
 
 
     if (
@@ -4322,7 +4343,9 @@ void addSerialMessage(
 
 
   Serial.print(prefix);
+
   Serial.print(" ");
+
   Serial.println(message);
 }
 
@@ -4708,13 +4731,30 @@ void handleSerialTouch(
 
 void updateAlarmBorder() {
 
+  // ----------------------------------------------------------
+  // Never draw alarm border over startup artwork.
+  // ----------------------------------------------------------
+
+  if (
+    startupSplashActive
+  ) {
+
+    return;
+  }
+
+
   bool alarm =
     false;
 
 
   // ----------------------------------------------------------
-  // Gauge:
-  // simulation or truck-data timeout ONLY.
+  // GAUGE:
+  //
+  // RED BORDER ONLY:
+  // 1. Simulation active
+  // 2. Real truck data timed out
+  //
+  // Nano/Mega communication state does NOT affect gauge.
   // ----------------------------------------------------------
 
   if (
@@ -4729,8 +4769,12 @@ void updateAlarmBorder() {
 
 
   // ----------------------------------------------------------
-  // Lightbar / Monitor:
-  // Nano or Mega communication loss ONLY.
+  // LIGHTBAR / SERIAL:
+  //
+  // RED BORDER ONLY:
+  // Nano or Mega communication loss.
+  //
+  // Truck-data state does NOT affect these screens.
   // ----------------------------------------------------------
 
   else if (
