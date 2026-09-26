@@ -30,27 +30,27 @@
     Row 2:
       CLOSE | TA LEFT | TA OUT | TA RIGHT | MONITOR
 
-    - Red border ONLY for Nano/Mega communication problems
+    - Red border ONLY for:
+        * Nano communication lost
+        * Mega communication lost
 
   SERIAL MONITOR
     - Opened only through MONITOR
     - X returns directly to Gauge screen
-    - Red border ONLY for Nano/Mega communication problems
+    - Red border ONLY for:
+        * Nano communication lost
+        * Mega communication lost
 
   ============================================================
   SECRET GESTURE
   ============================================================
 
-  Touch testing established:
+  Physical DOWN = RAW X DECREASING
 
-      Physical DOWN = RAW X DECREASING
-
-  Touch controller also produces brief 0/1-contact dropouts.
-
-  Gesture therefore:
+  Gesture:
     - requires 2 contacts to start
     - uses average raw X
-    - ignores brief dropouts
+    - tolerates brief contact dropouts
     - 150 ms release grace
     - 70 raw-unit downward threshold
     - no time limit
@@ -62,7 +62,7 @@
   After gesture opens Lightbar:
 
     1. Buttons locked for 1 second
-    2. Original fingers must actually be released
+    2. Original fingers must be released
     3. Release must last 150 ms
     4. Only then are buttons enabled
 
@@ -103,34 +103,22 @@ const uint16_t COLOR_BLACK = 0x0000;
 const uint16_t COLOR_WHITE = 0xFFFF;
 const uint16_t COLOR_RED   = 0xF800;
 
-
-// ------------------------------------------------------------
-// PERIOD-STYLE CONTROL COLORS
-// ------------------------------------------------------------
-
-// Dark/muted physical-switch blue
+// Period-style physical switch blue
 const uint16_t COLOR_BLUE = 0x0210;
 
-// Dark/muted failure purple
+// Period-style failure purple
 const uint16_t COLOR_PURPLE = 0x4010;
 
-// Text / monitor gray
 const uint16_t COLOR_GRAY = 0x8410;
-
-// General dark gray
 const uint16_t COLOR_DARK_GRAY = 0x2104;
 
-// CLOSE / MONITOR idle button
+// CLOSE / MONITOR idle color
 const uint16_t COLOR_BUTTON_IDLE = 0x1082;
 
-
-// ------------------------------------------------------------
-// OBS FORD INSTRUMENT GREEN
-// ------------------------------------------------------------
-
+// OBS Ford-style instrument green
 const uint16_t COLOR_OBS_GREEN = 0x87F0;
 
-// Confirmed GIGA commands use exactly the same green
+// Confirmed GIGA commands use gauge green
 const uint16_t COLOR_GREEN = COLOR_OBS_GREEN;
 
 
@@ -253,6 +241,15 @@ ScreenMode currentScreen = SCREEN_GAUGES;
 
 
 // ============================================================
+// ALARM BORDER STATE
+// ============================================================
+
+bool previousAlarmBorderVisible = false;
+
+ScreenMode previousAlarmBorderScreen = SCREEN_GAUGES;
+
+
+// ============================================================
 // FLASHING
 // ============================================================
 
@@ -277,16 +274,16 @@ struct EngineData {
 EngineData engineData;
 
 
-// ------------------------------------------------------------
+// ============================================================
 // SIMULATION
-// ------------------------------------------------------------
+// ============================================================
 
 bool simulateEngineData = true;
 
 
-// ------------------------------------------------------------
+// ============================================================
 // REAL TRUCK DATA WATCHDOG
-// ------------------------------------------------------------
+// ============================================================
 
 const unsigned long TRUCK_DATA_TIMEOUT = 3000;
 
@@ -377,28 +374,17 @@ unsigned long secretLastValidTouch = 0;
 
 
 // ============================================================
-// LIGHTBAR ENTRY SAFETY LOCK
+// LIGHTBAR ENTRY SAFETY
 // ============================================================
-
-// Minimum time after Lightbar opens before buttons can operate.
 
 const unsigned long LIGHTBAR_TOUCH_LOCKOUT = 1000;
 
-
-// Time that ALL touch must remain absent before the original
-// gesture fingers are considered truly released.
-
 const unsigned long LIGHTBAR_RELEASE_TIME = 150;
-
 
 unsigned long lightbarScreenOpenedAt = 0;
 
-
-// false while waiting for original swipe fingers to be removed
 bool lightbarEntryTouchReleased = true;
 
-
-// Tracks when zero contacts first appeared
 unsigned long lightbarNoTouchSince = 0;
 
 
@@ -461,6 +447,7 @@ void updateEngineData();
 void markTruckDataReceived();
 
 void drawLightbarScreen();
+void drawLightbarLinkStatus();
 
 void drawLightbarButton(
   int column,
@@ -549,10 +536,6 @@ void setup() {
   touch.begin();
 
 
-  // ----------------------------------------------------------
-  // INITIALIZE LIGHTBAR STATE
-  // ----------------------------------------------------------
-
   for (
     int i = 0;
     i < NUM_COMMANDS;
@@ -560,13 +543,9 @@ void setup() {
   ) {
 
     lightbar[i].physical = false;
-
     lightbar[i].giga = false;
-
     lightbar[i].effective = false;
-
     lightbar[i].megaConfirmed = false;
-
     lightbar[i].startupHold = false;
 
     lightbar[i].failed = false;
@@ -574,20 +553,12 @@ void setup() {
     lightbar[i].failureReason[0] = '\0';
 
     lightbar[i].nanoAckPending = false;
-
     lightbar[i].pendingStart = false;
-
     lightbar[i].nanoRetries = 0;
-
     lightbar[i].commandSentAt = 0;
-
     lightbar[i].waitingForConfirmation = false;
   }
 
-
-  // ----------------------------------------------------------
-  // INITIAL ENGINE DATA
-  // ----------------------------------------------------------
 
   engineData.ipr = 0;
   engineData.icp = 0;
@@ -596,16 +567,8 @@ void setup() {
   displayedICP = 0;
 
 
-  // ----------------------------------------------------------
-  // INITIAL SCREEN
-  // ----------------------------------------------------------
-
   drawGaugeScreen();
 
-
-  // ----------------------------------------------------------
-  // INITIAL COMMUNICATION
-  // ----------------------------------------------------------
 
   NanoSerial.println("GIGA_PING");
 
@@ -687,7 +650,7 @@ void loop() {
 
 
   // ----------------------------------------------------------
-  // FLASHING
+  // FLASH TIMER
   // ----------------------------------------------------------
 
   if (
@@ -706,6 +669,7 @@ void loop() {
     ) {
 
       refreshLightbarButtons();
+      drawLightbarLinkStatus();
     }
 
 
@@ -790,14 +754,14 @@ void updateEngineData() {
   /*
      FUTURE REAL TRUCK DATA
 
-     When a valid diagnostic update arrives:
+     When valid diagnostic data arrives:
 
        engineData.ipr = ...
        engineData.icp = ...
 
        markTruckDataReceived();
 
-     The 1996 truck diagnostic interface is not assumed
+     The 1996 F-350 diagnostic interface is not assumed
      to be modern CAN.
   */
 }
@@ -866,6 +830,16 @@ void drawGaugeScreen() {
 
   updateGaugeDisplay();
 
+
+  // Force border redraw for new screen
+
+  previousAlarmBorderScreen =
+    SCREEN_LIGHTBAR;
+
+  previousAlarmBorderVisible =
+    false;
+
+
   updateAlarmBorder();
 }
 
@@ -875,10 +849,6 @@ void drawGaugeScreen() {
 // ============================================================
 
 void drawGaugeStatic() {
-
-  // ----------------------------------------------------------
-  // HEADER
-  // ----------------------------------------------------------
 
   display.setTextColor(
     COLOR_OBS_GREEN,
@@ -922,7 +892,7 @@ void drawGaugeStatic() {
 
 
   // ----------------------------------------------------------
-  // GAUGE LABELS
+  // IPR / ICP LABELS
   // ----------------------------------------------------------
 
   display.setTextSize(4);
@@ -1530,9 +1500,6 @@ void handleTouch() {
       contacts
     );
 
-    // Never process a Lightbar button while we're still
-    // waiting for the gesture fingers to be removed.
-
     return;
   }
 
@@ -1660,10 +1627,6 @@ void handleSecretGesture(
       now;
 
 
-    // --------------------------------------------------------
-    // LOCKED UNTIL RELEASE
-    // --------------------------------------------------------
-
     if (
       secretGestureLocked
     ) {
@@ -1760,13 +1723,7 @@ void handleSecretGesture(
 
 
   // ----------------------------------------------------------
-  // ZERO OR ONE CONTACT
-  // ----------------------------------------------------------
-  //
-  // Do NOT immediately reset.
-  //
-  // Actual testing showed temporary 2 -> 0 -> 2 and
-  // 2 -> 1 -> 2 reports only a few milliseconds apart.
+  // TEMPORARY CONTACT DROPOUT
   // ----------------------------------------------------------
 
   if (
@@ -1825,13 +1782,7 @@ void updateLightbarEntryRelease(
 
 
   // ----------------------------------------------------------
-  // ANY CONTACT PRESENT
-  // ----------------------------------------------------------
-  //
-  // Fingers are still physically on the screen, or the touch
-  // controller is still reporting at least one contact.
-  //
-  // Reset the no-touch timer.
+  // STILL TOUCHED
   // ----------------------------------------------------------
 
   if (
@@ -1863,12 +1814,6 @@ void updateLightbarEntryRelease(
   // ----------------------------------------------------------
   // TRUE RELEASE
   // ----------------------------------------------------------
-  //
-  // Zero contacts must remain continuously present for
-  // LIGHTBAR_RELEASE_TIME.
-  //
-  // A 4-5 ms touch-controller dropout therefore does NOT count.
-  // ----------------------------------------------------------
 
   if (
     now -
@@ -1884,9 +1829,6 @@ void updateLightbarEntryRelease(
       0;
 
 
-    // Require a completely new touch before any button
-    // activation.
-
     buttonTouchActive =
       false;
   }
@@ -1894,12 +1836,10 @@ void updateLightbarEntryRelease(
 
 
 // ============================================================
-// CHECK LIGHTBAR TOUCH ENABLED
+// LIGHTBAR TOUCH ENABLED
 // ============================================================
 
 bool lightbarTouchEnabled() {
-
-  // Original gesture fingers must be gone.
 
   if (
     !lightbarEntryTouchReleased
@@ -1908,8 +1848,6 @@ bool lightbarTouchEnabled() {
     return false;
   }
 
-
-  // One-second entry lockout must also have expired.
 
   if (
     millis() -
@@ -1926,7 +1864,7 @@ bool lightbarTouchEnabled() {
 
 
 // ============================================================
-// TOUCH MAPPING FOR NORMAL BUTTONS
+// NORMAL TOUCH MAPPING
 // ============================================================
 
 void mapTouchPoint(
@@ -1934,14 +1872,6 @@ void mapTouchPoint(
   int &x,
   int &y
 ) {
-
-  /*
-     Existing landscape mapping.
-
-     IMPORTANT:
-     The secret gesture does NOT use this mapping.
-     It uses experimentally verified raw coordinates.
-  */
 
   x =
     raw.y;
@@ -1963,7 +1893,7 @@ void drawLightbarScreen() {
 
 
   // ----------------------------------------------------------
-  // START ENTRY SAFETY LOCK
+  // ENTRY SAFETY LOCK
   // ----------------------------------------------------------
 
   lightbarScreenOpenedAt =
@@ -1978,14 +1908,12 @@ void drawLightbarScreen() {
     0;
 
 
-  // Prevent the gesture touch from becoming a button touch.
-
   buttonTouchActive =
     true;
 
 
   // ----------------------------------------------------------
-  // DRAW SCREEN
+  // SCREEN
   // ----------------------------------------------------------
 
   display.fillScreen(
@@ -2015,7 +1943,117 @@ void drawLightbarScreen() {
 
   refreshLightbarButtons();
 
+  drawLightbarLinkStatus();
+
+
+  // Force alarm border to evaluate for this screen.
+
+  previousAlarmBorderScreen =
+    SCREEN_GAUGES;
+
+  previousAlarmBorderVisible =
+    false;
+
+
   updateAlarmBorder();
+}
+
+
+// ============================================================
+// LIGHTBAR LINK STATUS
+// ============================================================
+//
+// TEMPORARY DEBUG DISPLAY.
+//
+// If the border is flashing while this says:
+//
+//     N:OK M:OK
+//
+// then the communication flags are not causing the flashing
+// and we know the problem is purely display/render related.
+//
+// ============================================================
+
+void drawLightbarLinkStatus() {
+
+  display.fillRect(
+    580,
+    15,
+    205,
+    30,
+    COLOR_BLACK
+  );
+
+
+  display.setTextSize(2);
+
+
+  display.setTextColor(
+    COLOR_OBS_GREEN,
+    COLOR_BLACK
+  );
+
+
+  display.setCursor(
+    580,
+    20
+  );
+
+
+  display.print("N:");
+
+
+  if (
+    nanoLinkLost
+  ) {
+
+    display.setTextColor(
+      COLOR_RED,
+      COLOR_BLACK
+    );
+
+    display.print("LOST");
+
+  } else {
+
+    display.setTextColor(
+      COLOR_OBS_GREEN,
+      COLOR_BLACK
+    );
+
+    display.print("OK");
+  }
+
+
+  display.setTextColor(
+    COLOR_OBS_GREEN,
+    COLOR_BLACK
+  );
+
+
+  display.print(" M:");
+
+
+  if (
+    megaLinkLost
+  ) {
+
+    display.setTextColor(
+      COLOR_RED,
+      COLOR_BLACK
+    );
+
+    display.print("LOST");
+
+  } else {
+
+    display.setTextColor(
+      COLOR_OBS_GREEN,
+      COLOR_BLACK
+    );
+
+    display.print("OK");
+  }
 }
 
 
@@ -2186,7 +2224,7 @@ void drawLightbarButton(
 
 
   // ----------------------------------------------------------
-  // TWO-LINE TRAFFIC BREAKER LABEL
+  // TRAFFIC BREAKER
   // ----------------------------------------------------------
 
   if (
@@ -2278,15 +2316,12 @@ uint16_t getButtonColor(
   // ----------------------------------------------------------
   // PHYSICAL SOURCE
   // ----------------------------------------------------------
-  //
-  // Physical control always has visual priority.
-  // ----------------------------------------------------------
 
   if (
     s.physical
   ) {
 
-    // Startup hold = flashing muted blue
+    // Startup hold = flashing blue
 
     if (
       s.startupHold
@@ -2303,8 +2338,6 @@ uint16_t getButtonColor(
       return COLOR_BLACK;
     }
 
-
-    // Normal physical control = muted blue
 
     return COLOR_BLUE;
   }
@@ -2334,9 +2367,6 @@ uint16_t getButtonColor(
   // ----------------------------------------------------------
   // CONFIRMED GIGA REQUEST
   // ----------------------------------------------------------
-  //
-  // Uses exactly the same OBS green as the gauges.
-  // ----------------------------------------------------------
 
   if (
     s.giga &&
@@ -2346,10 +2376,6 @@ uint16_t getButtonColor(
     return COLOR_OBS_GREEN;
   }
 
-
-  // ----------------------------------------------------------
-  // INACTIVE
-  // ----------------------------------------------------------
 
   return COLOR_BLACK;
 }
@@ -2363,10 +2389,6 @@ void handleLightbarTouch(
   int x,
   int y
 ) {
-
-  // ----------------------------------------------------------
-  // SAFETY CHECK
-  // ----------------------------------------------------------
 
   if (
     !lightbarTouchEnabled()
@@ -2532,9 +2554,7 @@ void handleLightbarTouch(
     column
   ) {
 
-    // --------------------------------------------------------
     // CLOSE
-    // --------------------------------------------------------
 
     case 0:
 
@@ -2543,9 +2563,7 @@ void handleLightbarTouch(
       break;
 
 
-    // --------------------------------------------------------
     // TA LEFT
-    // --------------------------------------------------------
 
     case 1:
 
@@ -2559,9 +2577,7 @@ void handleLightbarTouch(
       break;
 
 
-    // --------------------------------------------------------
     // TA OUT
-    // --------------------------------------------------------
 
     case 2:
 
@@ -2575,9 +2591,7 @@ void handleLightbarTouch(
       break;
 
 
-    // --------------------------------------------------------
     // TA RIGHT
-    // --------------------------------------------------------
 
     case 3:
 
@@ -2591,9 +2605,7 @@ void handleLightbarTouch(
       break;
 
 
-    // --------------------------------------------------------
     // MONITOR
-    // --------------------------------------------------------
 
     case 4:
 
@@ -2653,8 +2665,6 @@ void sendGigaCommand(
   s.failureReason[0] =
     '\0';
 
-
-  // Reflect requested GIGA source locally
 
   s.giga =
     start;
@@ -2989,6 +2999,16 @@ void processNanoLine(
     }
 
 
+    if (
+      currentScreen ==
+      SCREEN_LIGHTBAR
+    ) {
+
+      drawLightbarLinkStatus();
+      updateAlarmBorder();
+    }
+
+
     return;
   }
 
@@ -3030,6 +3050,15 @@ void processNanoLine(
       true;
 
 
+    if (
+      currentScreen ==
+      SCREEN_LIGHTBAR
+    ) {
+
+      drawLightbarLinkStatus();
+    }
+
+
     updateAlarmBorder();
 
     return;
@@ -3049,6 +3078,15 @@ void processNanoLine(
 
     megaLinkLost =
       false;
+
+
+    if (
+      currentScreen ==
+      SCREEN_LIGHTBAR
+    ) {
+
+      drawLightbarLinkStatus();
+    }
 
 
     updateAlarmBorder();
@@ -3584,6 +3622,14 @@ void drawSerialScreen() {
 
   refreshSerialScreen();
 
+
+  previousAlarmBorderScreen =
+    SCREEN_LIGHTBAR;
+
+  previousAlarmBorderVisible =
+    false;
+
+
   updateAlarmBorder();
 }
 
@@ -3656,8 +3702,6 @@ void refreshSerialScreen() {
       1000;
 
 
-    // Timestamp
-
     display.setTextColor(
       COLOR_GRAY,
       COLOR_BLACK
@@ -3685,8 +3729,6 @@ void refreshSerialScreen() {
       timeText
     );
 
-
-    // Direction
 
     const char *message =
       serialHistory[index];
@@ -3782,78 +3824,98 @@ void handleSerialTouch(
 
 void updateAlarmBorder() {
 
-  bool alarm =
-    false;
+  bool alarm = false;
 
 
-  switch (
-    currentScreen
+  // ----------------------------------------------------------
+  // GAUGE SCREEN
+  //
+  // ONLY engine-data conditions can trigger the border.
+  // ----------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_GAUGES
   ) {
 
-    // ========================================================
-    // GAUGE SCREEN
-    //
-    // ENGINE / TRUCK DATA ONLY
-    //
-    // Nano/Mega lightbar communication status has NO effect
-    // on the Gauge screen border.
-    // ========================================================
-
-    case SCREEN_GAUGES:
-
-      alarm =
-        simulateEngineData ||
-        truckDataTimedOut;
-
-      break;
-
-
-    // ========================================================
-    // LIGHTBAR SCREEN
-    //
-    // LIGHTBAR COMMUNICATION ONLY
-    //
-    // Simulation/truck-data problems have NO effect here.
-    // ========================================================
-
-    case SCREEN_LIGHTBAR:
-
-      alarm =
-        nanoLinkLost ||
-        megaLinkLost;
-
-      break;
-
-
-    // ========================================================
-    // SERIAL MONITOR
-    //
-    // LIGHTBAR COMMUNICATION ONLY
-    // ========================================================
-
-    case SCREEN_SERIAL:
-
-      alarm =
-        nanoLinkLost ||
-        megaLinkLost;
-
-      break;
+    alarm =
+      simulateEngineData ||
+      truckDataTimedOut;
   }
 
 
+  // ----------------------------------------------------------
+  // LIGHTBAR / SERIAL
+  //
+  // ONLY Nano/Mega communication conditions can trigger it.
+  // ----------------------------------------------------------
+
+  else if (
+    currentScreen ==
+    SCREEN_LIGHTBAR ||
+    currentScreen ==
+    SCREEN_SERIAL
+  ) {
+
+    alarm =
+      nanoLinkLost ||
+      megaLinkLost;
+  }
+
+
+  // ----------------------------------------------------------
+  // SHOULD RED CURRENTLY BE VISIBLE?
+  // ----------------------------------------------------------
+
+  bool borderVisible =
+    alarm &&
+    flashState;
+
+
+  // ----------------------------------------------------------
+  // DID SCREEN CHANGE?
+  // ----------------------------------------------------------
+
+  bool screenChanged =
+    previousAlarmBorderScreen !=
+    currentScreen;
+
+
+  // ----------------------------------------------------------
+  // NO DISPLAY CHANGE REQUIRED
+  // ----------------------------------------------------------
+
+  if (
+    !screenChanged &&
+    borderVisible ==
+    previousAlarmBorderVisible
+  ) {
+
+    return;
+  }
+
+
+  previousAlarmBorderScreen =
+    currentScreen;
+
+
+  previousAlarmBorderVisible =
+    borderVisible;
+
+
+  // ----------------------------------------------------------
+  // BORDER COLOR
+  // ----------------------------------------------------------
+
   uint16_t borderColor =
+    borderVisible ?
+    COLOR_RED :
     COLOR_BLACK;
 
 
-  if (
-    alarm &&
-    flashState
-  ) {
-
-    borderColor =
-      COLOR_RED;
-  }
-
+  // ----------------------------------------------------------
+  // DRAW BORDER
+  // ----------------------------------------------------------
 
   display.drawRect(
     0,
