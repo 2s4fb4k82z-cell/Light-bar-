@@ -3,71 +3,39 @@
   CODE 3 MX7000 - NANO ESP32 CENTRAL CONTROLLER
   ============================================================
 
-  BOARD:
-    Arduino Nano ESP32
+  Arduino Nano ESP32
 
-  ROLE:
-    - Read physical switches
-    - Debounce physical switches
-    - Apply 120-second startup hold
-    - Handle GIGA requests
-    - Handle physical-switch overrides
-    - Arbitrate physical + GIGA requests
-    - Select Traffic Advisor winner
-    - Command Mega
-    - Verify Mega ACKs
-    - Maintain Mega heartbeat/watchdog
-    - Maintain GIGA heartbeat/watchdog
-    - Report authoritative state to GIGA
-
-
-  ============================================================
-  PHYSICAL INPUTS
-  ============================================================
-
-  All inputs are ACTIVE LOW.
-
+  PHYSICAL INPUTS - ACTIVE LOW
+  --------------------------------
   D2  OUTERS
   D3  INTERMEDIATES
   D4  INNERS
   D5  TRAFFICBREAKERS
   D6  LEDS
-
   D7  TLEFT
   D8  TRIGHT
   D9  TOUT
-
   A0  LEFTSIGNAL
   A1  RIGHTSIGNAL
 
 
-  ============================================================
-  NANO <-> MEGA UART
-  ============================================================
-
+  NANO <-> MEGA
+  --------------------------------
   Nano D10 TX -> Mega D19 RX1
   Nano D11 RX <- Mega D18 TX1
-
-  Baud: 38400
+  38400 baud
 
   IMPORTANT:
   Mega TX is 5V.
   Nano RX is 3.3V.
-
-  Use level shifting / resistor divider on:
-    Mega D18 -> Nano D11
+  Use level shifting / resistor divider.
 
 
-  ============================================================
-  NANO <-> GIGA UART
-  ============================================================
-
+  NANO <-> GIGA
+  --------------------------------
   Nano D13 TX -> GIGA D0 RX
   Nano D12 RX <- GIGA D1 TX
-
-  Baud: 38400
-
-  Both sides use 3.3V logic.
+  38400 baud
 
 
   ============================================================
@@ -75,38 +43,64 @@
   ============================================================
 
   GIGA:
-
-    OVERRIDE OUTERS ON
+      OVERRIDE OUTERS ON
 
   Nano:
-
-    ACK OVERRIDE OUTERS ON
-    CONFIRMED OVERRIDE OUTERS ON
+      ACK OVERRIDE OUTERS ON
+      CONFIRMED OVERRIDE OUTERS ON
 
   State:
-
-    STATE OUTERS P=1 G=0 E=0 M=0 H=0 O=1
-
+      STATE OUTERS P=1 G=0 E=0 M=0 H=0 O=1
 
   O = physical override
 
+  Override suppresses ONLY physical source.
 
-  Override suppresses ONLY the physical source:
-
-    allowedPhysical =
-      physicalRequest &&
-      !physicalOverride;
+  Physical switch OFF automatically clears override.
 
 
-    effective =
-      allowedPhysical ||
-      gigaRequest;
+  ============================================================
+  STALE ACK / RACE PROTECTION
+  ============================================================
+
+  Mega ACK means:
+
+      "Mega just reached this state."
+
+  It DOES NOT automatically mean:
+
+      "The newest GIGA request succeeded."
 
 
-  Turning the physical switch OFF automatically clears
-  its override.
+  Example:
 
+      Nano -> Mega:
+          START OUTERS
 
+      GIGA changes request:
+          STOP OUTERS
+
+      Mega replies late:
+          ACK START OUTERS
+
+  Nano records:
+
+      Mega OUTERS = ON
+
+  But current desired state is OFF.
+
+  Therefore Nano immediately schedules:
+
+      STOP OUTERS
+
+  and DOES NOT send:
+
+      CONFIRMED START OUTERS
+
+  to GIGA.
+
+  Only a Mega state matching the CURRENT desired/GIGA request
+  can produce the corresponding GIGA confirmation.
   ============================================================
 */
 
@@ -120,8 +114,7 @@
 // SERIAL SPEEDS
 // ============================================================
 
-const unsigned long USB_BAUD = 115200;
-
+const unsigned long USB_BAUD  = 115200;
 const unsigned long MEGA_BAUD = 38400;
 const unsigned long GIGA_BAUD = 38400;
 
@@ -130,17 +123,7 @@ const unsigned long GIGA_BAUD = 38400;
 // UARTS
 // ============================================================
 
-// Nano <-> Mega
-// RX = D11
-// TX = D10
-
 HardwareSerial MegaSerial(1);
-
-
-// Nano <-> GIGA
-// RX = D12
-// TX = D13
-
 HardwareSerial GigaSerial(2);
 
 
@@ -201,23 +184,23 @@ const char *commandNames[NUM_COMMANDS] = {
 
 const int physicalPins[NUM_COMMANDS] = {
 
-  D2,   // OUTERS
-  D3,   // INTERMEDIATES
-  D4,   // INNERS
-  D5,   // TRAFFICBREAKERS
-  D6,   // LEDS
+  D2,
+  D3,
+  D4,
+  D5,
+  D6,
 
-  D7,   // TLEFT
-  D8,   // TRIGHT
-  D9,   // TOUT
+  D7,
+  D8,
+  D9,
 
-  A0,   // LEFTSIGNAL
-  A1    // RIGHTSIGNAL
+  A0,
+  A1
 };
 
 
 // ============================================================
-// INPUT DEBOUNCE
+// DEBOUNCE
 // ============================================================
 
 const unsigned long DEBOUNCE_TIME = 50;
@@ -226,42 +209,18 @@ bool rawPhysicalState[NUM_COMMANDS];
 
 bool physicalRequest[NUM_COMMANDS];
 
-bool previousPhysicalRequest[NUM_COMMANDS];
-
 unsigned long physicalChangedAt[NUM_COMMANDS];
 
 
 // ============================================================
-// GIGA REQUESTS
+// SOURCE STATES
 // ============================================================
 
 bool gigaRequest[NUM_COMMANDS];
 
-
-// ============================================================
-// PHYSICAL OVERRIDE
-// ============================================================
-
-// true:
-//
-// Physical switch is physically ON,
-// but its request is ignored.
-//
-// This DOES NOT block a GIGA START request.
-
 bool physicalOverride[NUM_COMMANDS];
 
-
-// ============================================================
-// EFFECTIVE DESIRED STATE
-// ============================================================
-
 bool effectiveState[NUM_COMMANDS];
-
-
-// ============================================================
-// MEGA CONFIRMED STATE
-// ============================================================
 
 bool megaConfirmedState[NUM_COMMANDS];
 
@@ -289,13 +248,12 @@ unsigned long physicalTAOrder[NUM_COMMANDS];
 
 unsigned long gigaTAOrder[NUM_COMMANDS];
 
-int desiredTAMode = -1;
-
+int desiredTAMode   = -1;
 int confirmedTAMode = -1;
 
 
 // ============================================================
-// MEGA COMMAND RETRIES
+// MEGA PENDING COMMAND
 // ============================================================
 
 const unsigned long MEGA_COMMAND_TIMEOUT = 1500;
@@ -325,11 +283,9 @@ MegaPendingCommand megaPending[NUM_COMMANDS];
 // ============================================================
 
 const unsigned long MEGA_PING_INTERVAL = 5000;
-
-const unsigned long MEGA_PONG_TIMEOUT = 15000;
+const unsigned long MEGA_PONG_TIMEOUT  = 15000;
 
 unsigned long lastMegaPing = 0;
-
 unsigned long lastMegaPong = 0;
 
 bool megaLinkLost = true;
@@ -364,40 +320,27 @@ int megaResyncIndex = 0;
 // ============================================================
 
 char megaRxBuffer[128];
-
 byte megaRxIndex = 0;
 
-
 char gigaRxBuffer[160];
-
 byte gigaRxIndex = 0;
 
 
 // ============================================================
-// FUNCTION PROTOTYPES
+// PROTOTYPES
 // ============================================================
 
-int commandIndexFromName(
-  const char *name
-);
+int commandIndexFromName(const char *name);
 
-bool isTACommand(
-  int command
-);
+bool isTACommand(int command);
 
-bool physicalSourceAllowed(
-  int command
-);
+bool physicalSourceAllowed(int command);
 
 void readPhysicalInputs();
 
 void handlePhysicalTransition(
   int command,
   bool active
-);
-
-void clearPhysicalOverride(
-  int command
 );
 
 void setPhysicalOverride(
@@ -409,11 +352,13 @@ void updateStartupHolds();
 
 void updateEffectiveStates();
 
-void updateTAWinner();
-
 int determineTAWinner();
 
 void reconcileMegaOutputs();
+
+void reconcileAfterMegaAck(
+  int command
+);
 
 void requestMegaState(
   int command,
@@ -493,10 +438,6 @@ void setup() {
   );
 
 
-  // ----------------------------------------------------------
-  // MEGA UART
-  // ----------------------------------------------------------
-
   MegaSerial.begin(
     MEGA_BAUD,
     SERIAL_8N1,
@@ -505,10 +446,6 @@ void setup() {
   );
 
 
-  // ----------------------------------------------------------
-  // GIGA UART
-  // ----------------------------------------------------------
-
   GigaSerial.begin(
     GIGA_BAUD,
     SERIAL_8N1,
@@ -516,10 +453,6 @@ void setup() {
     GIGA_TX_PIN
   );
 
-
-  // ----------------------------------------------------------
-  // INITIALIZE ARRAYS
-  // ----------------------------------------------------------
 
   startupHoldStartedAt =
     millis();
@@ -551,10 +484,6 @@ void setup() {
       active;
 
 
-    previousPhysicalRequest[i] =
-      active;
-
-
     physicalChangedAt[i] =
       millis();
 
@@ -574,10 +503,6 @@ void setup() {
     megaConfirmedState[i] =
       false;
 
-
-    // --------------------------------------------------------
-    // Anything physically ON at boot receives startup hold.
-    // --------------------------------------------------------
 
     startupHeld[i] =
       active;
@@ -617,10 +542,7 @@ void setup() {
 
 
   // ----------------------------------------------------------
-  // Assign initial physical TA activation order.
-  //
-  // They remain held from effective output until startup hold
-  // expires, but the order is remembered.
+  // Remember initial TA physical activation order.
   // ----------------------------------------------------------
 
   for (
@@ -640,7 +562,7 @@ void setup() {
 
 
   // ----------------------------------------------------------
-  // INITIAL HEARTBEAT TO MEGA
+  // Initial Mega heartbeat.
   // ----------------------------------------------------------
 
   MegaSerial.println(
@@ -719,7 +641,7 @@ int commandIndexFromName(
 
 
 // ============================================================
-// TRAFFIC ADVISOR COMMAND?
+// IS TA COMMAND
 // ============================================================
 
 bool isTACommand(
@@ -735,7 +657,7 @@ bool isTACommand(
 
 
 // ============================================================
-// IS PHYSICAL SOURCE CURRENTLY ALLOWED?
+// PHYSICAL SOURCE ALLOWED
 // ============================================================
 
 bool physicalSourceAllowed(
@@ -750,10 +672,6 @@ bool physicalSourceAllowed(
   }
 
 
-  // ----------------------------------------------------------
-  // GIGA physical override suppresses physical source.
-  // ----------------------------------------------------------
-
   if (
     physicalOverride[command]
   ) {
@@ -761,10 +679,6 @@ bool physicalSourceAllowed(
     return false;
   }
 
-
-  // ----------------------------------------------------------
-  // Startup-held source is also temporarily excluded.
-  // ----------------------------------------------------------
 
   if (
     startupHeld[command]
@@ -779,7 +693,7 @@ bool physicalSourceAllowed(
 
 
 // ============================================================
-// READ / DEBOUNCE PHYSICAL INPUTS
+// READ PHYSICAL INPUTS
 // ============================================================
 
 void readPhysicalInputs() {
@@ -800,10 +714,6 @@ void readPhysicalInputs() {
       ) == LOW;
 
 
-    // --------------------------------------------------------
-    // RAW STATE CHANGED
-    // --------------------------------------------------------
-
     if (
       raw !=
       rawPhysicalState[i]
@@ -817,10 +727,6 @@ void readPhysicalInputs() {
         now;
     }
 
-
-    // --------------------------------------------------------
-    // WAIT FOR DEBOUNCE
-    // --------------------------------------------------------
 
     if (
       raw ==
@@ -841,14 +747,6 @@ void readPhysicalInputs() {
     }
 
 
-    // --------------------------------------------------------
-    // ACCEPT DEBOUNCED CHANGE
-    // --------------------------------------------------------
-
-    previousPhysicalRequest[i] =
-      physicalRequest[i];
-
-
     physicalRequest[i] =
       raw;
 
@@ -862,7 +760,7 @@ void readPhysicalInputs() {
 
 
 // ============================================================
-// PHYSICAL INPUT TRANSITION
+// PHYSICAL TRANSITION
 // ============================================================
 
 void handlePhysicalTransition(
@@ -871,36 +769,26 @@ void handlePhysicalTransition(
 ) {
 
   // ==========================================================
-  // SWITCH TURNED ON
+  // PHYSICAL ON
   // ==========================================================
 
   if (
     active
   ) {
 
-    // --------------------------------------------------------
-    // This is a deliberate post-boot activation.
-    //
-    // If a startup hold had previously been canceled by the
-    // switch turning OFF, it does NOT return.
-    // --------------------------------------------------------
+    // Any deliberate post-boot activation bypasses the
+    // original boot hold.
 
     startupHeld[command] =
       false;
 
 
-    // --------------------------------------------------------
-    // Override should already be false because physical OFF
-    // clears it, but force it here as additional protection.
-    // --------------------------------------------------------
+    // OFF automatically clears override, so a fresh physical
+    // activation always begins un-overridden.
 
     physicalOverride[command] =
       false;
 
-
-    // --------------------------------------------------------
-    // Record physical TA activation order.
-    // --------------------------------------------------------
 
     if (
       isTACommand(
@@ -915,31 +803,17 @@ void handlePhysicalTransition(
 
 
   // ==========================================================
-  // SWITCH TURNED OFF
+  // PHYSICAL OFF
   // ==========================================================
 
   else {
-
-    // --------------------------------------------------------
-    // Turning physical switch OFF permanently cancels any
-    // startup hold for this activation.
-    // --------------------------------------------------------
 
     startupHeld[command] =
       false;
 
 
-    // --------------------------------------------------------
-    // CRITICAL OVERRIDE RULE:
-    //
-    // Physical switch OFF automatically clears its override.
-    //
-    // Therefore:
-    //
-    //   RED -> DARK
-    //
-    // assuming no GIGA request remains.
-    // --------------------------------------------------------
+    // Critical override behavior:
+    // physical OFF clears override.
 
     physicalOverride[command] =
       false;
@@ -959,36 +833,7 @@ void handlePhysicalTransition(
 
   updateEffectiveStates();
 
-
-  sendGigaState(
-    command
-  );
-}
-
-
-// ============================================================
-// CLEAR PHYSICAL OVERRIDE
-// ============================================================
-
-void clearPhysicalOverride(
-  int command
-) {
-
-  if (
-    command < 0 ||
-    command >= NUM_COMMANDS
-  ) {
-
-    return;
-  }
-
-
-  physicalOverride[command] =
-    false;
-
-
-  updateEffectiveStates();
-
+  reconcileMegaOutputs();
 
   sendGigaState(
     command
@@ -1014,10 +859,6 @@ void setPhysicalOverride(
   }
 
 
-  // ----------------------------------------------------------
-  // Override only makes sense while physical switch is ON.
-  // ----------------------------------------------------------
-
   if (
     enabled &&
     !physicalRequest[command]
@@ -1037,9 +878,7 @@ void setPhysicalOverride(
 
   updateEffectiveStates();
 
-
   reconcileMegaOutputs();
-
 
   sendGigaState(
     command
@@ -1048,7 +887,7 @@ void setPhysicalOverride(
 
 
 // ============================================================
-// STARTUP HOLD MANAGEMENT
+// STARTUP HOLD
 // ============================================================
 
 void updateStartupHolds() {
@@ -1072,10 +911,7 @@ void updateStartupHolds() {
 
 
     // --------------------------------------------------------
-    // Physical switch turned OFF.
-    //
-    // Normally handled immediately in transition handler,
-    // but retain this as protection.
+    // Physical OFF cancels hold and override.
     // --------------------------------------------------------
 
     if (
@@ -1089,6 +925,10 @@ void updateStartupHolds() {
       physicalOverride[i] =
         false;
 
+
+      updateEffectiveStates();
+
+      reconcileMegaOutputs();
 
       sendGigaState(
         i
@@ -1119,6 +959,7 @@ void updateStartupHolds() {
 
       updateEffectiveStates();
 
+      reconcileMegaOutputs();
 
       sendGigaState(
         i
@@ -1130,7 +971,7 @@ void updateStartupHolds() {
 
 
     // --------------------------------------------------------
-    // REPORT REMAINING TIME EVERY 10 SECONDS
+    // HOLD REPORT
     // --------------------------------------------------------
 
     if (
@@ -1176,7 +1017,7 @@ void updateStartupHolds() {
 
 
 // ============================================================
-// DETERMINE TRAFFIC ADVISOR WINNER
+// DETERMINE TA WINNER
 // ============================================================
 
 int determineTAWinner() {
@@ -1196,7 +1037,7 @@ int determineTAWinner() {
   ) {
 
     // --------------------------------------------------------
-    // PHYSICAL SOURCE
+    // PHYSICAL TA SOURCE
     // --------------------------------------------------------
 
     if (
@@ -1221,9 +1062,7 @@ int determineTAWinner() {
 
 
     // --------------------------------------------------------
-    // GIGA SOURCE
-    //
-    // Physical override DOES NOT suppress GIGA.
+    // GIGA TA SOURCE
     // --------------------------------------------------------
 
     if (
@@ -1251,27 +1090,17 @@ int determineTAWinner() {
 
 
 // ============================================================
-// UPDATE TA WINNER
-// ============================================================
-
-void updateTAWinner() {
-
-  desiredTAMode =
-    determineTAWinner();
-}
-
-
-// ============================================================
-// UPDATE EFFECTIVE DESIRED STATES
+// UPDATE EFFECTIVE STATE
 // ============================================================
 
 void updateEffectiveStates() {
 
-  updateTAWinner();
+  desiredTAMode =
+    determineTAWinner();
 
 
   // ==========================================================
-  // NORMAL COMMANDS
+  // NON-TA
   // ==========================================================
 
   for (
@@ -1280,7 +1109,6 @@ void updateEffectiveStates() {
     i++
   ) {
 
-    // TA handled separately.
     if (
       isTACommand(
         i
@@ -1297,12 +1125,6 @@ void updateEffectiveStates() {
       );
 
 
-    // --------------------------------------------------------
-    // OVERRIDE ONLY SUPPRESSES PHYSICAL.
-    //
-    // GIGA remains independent.
-    // --------------------------------------------------------
-
     effectiveState[i] =
       physicalAllowed ||
       gigaRequest[i];
@@ -1310,9 +1132,7 @@ void updateEffectiveStates() {
 
 
   // ==========================================================
-  // TRAFFIC ADVISOR
-  //
-  // Only winner becomes effective.
+  // TA
   // ==========================================================
 
   effectiveState[
@@ -1338,7 +1158,7 @@ void updateEffectiveStates() {
 
 
 // ============================================================
-// RECONCILE DESIRED STATE WITH MEGA
+// RECONCILE MEGA OUTPUTS
 // ============================================================
 
 void reconcileMegaOutputs() {
@@ -1362,9 +1182,6 @@ void reconcileMegaOutputs() {
 
   // ==========================================================
   // TRAFFIC ADVISOR
-  //
-  // Handle winner as a mode rather than three unrelated
-  // outputs.
   // ==========================================================
 
   if (
@@ -1373,7 +1190,7 @@ void reconcileMegaOutputs() {
   ) {
 
     // --------------------------------------------------------
-    // Stop old TA first.
+    // Stop old confirmed TA first.
     // --------------------------------------------------------
 
     if (
@@ -1402,7 +1219,7 @@ void reconcileMegaOutputs() {
 
 
     // --------------------------------------------------------
-    // Start new TA.
+    // Start desired TA.
     // --------------------------------------------------------
 
     if (
@@ -1432,7 +1249,7 @@ void reconcileMegaOutputs() {
 
 
   // ==========================================================
-  // NON-TA COMMANDS
+  // NON-TA
   // ==========================================================
 
   for (
@@ -1471,8 +1288,81 @@ void reconcileMegaOutputs() {
       );
 
 
-      // One new command per pass.
       return;
+    }
+  }
+}
+
+
+// ============================================================
+// RECONCILE IMMEDIATELY AFTER MEGA ACK
+//
+// THIS IS THE MAIN RACE-CONDITION FIX.
+// ============================================================
+
+void reconcileAfterMegaAck(
+  int command
+) {
+
+  updateEffectiveStates();
+
+
+  // ==========================================================
+  // TA
+  // ==========================================================
+
+  if (
+    isTACommand(
+      command
+    )
+  ) {
+
+    // --------------------------------------------------------
+    // The ACK may have made a TA mode active that is no longer
+    // the desired winner.
+    //
+    // reconcileMegaOutputs() will first STOP the stale mode,
+    // then START the current winner.
+    // --------------------------------------------------------
+
+    if (
+      confirmedTAMode !=
+      desiredTAMode
+    ) {
+
+      reconcileMegaOutputs();
+    }
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // NORMAL OUTPUT
+  // ==========================================================
+
+  if (
+    megaConfirmedState[command] !=
+    effectiveState[command]
+  ) {
+
+    // --------------------------------------------------------
+    // Mega reached stale state.
+    //
+    // Do not wait for the normal loop.
+    // Immediately request correction.
+    // --------------------------------------------------------
+
+    if (
+      !megaPending[command].active
+    ) {
+
+      requestMegaState(
+        command,
+        effectiveState[command],
+        false
+      );
     }
   }
 }
@@ -1525,7 +1415,7 @@ void requestMegaState(
 
 
 // ============================================================
-// TRANSMIT COMMAND TO MEGA
+// TRANSMIT MEGA COMMAND
 // ============================================================
 
 void transmitMegaCommand(
@@ -1612,6 +1502,63 @@ void retryMegaCommands() {
     }
 
 
+    // --------------------------------------------------------
+    // IMPORTANT:
+    //
+    // If desired state changed while command was pending,
+    // cancel obsolete transaction immediately.
+    //
+    // This prevents retrying START after desired became STOP
+    // or retrying STOP after desired became START.
+    // --------------------------------------------------------
+
+    if (
+      !pending.partOfResync
+    ) {
+
+      bool currentDesired;
+
+
+      if (
+        isTACommand(
+          i
+        )
+      ) {
+
+        currentDesired =
+          desiredTAMode ==
+          i;
+
+      } else {
+
+        currentDesired =
+          effectiveState[i];
+      }
+
+
+      if (
+        pending.targetState !=
+        currentDesired
+      ) {
+
+        pending.active =
+          false;
+
+
+        pending.partOfResync =
+          false;
+
+
+        // Immediately reconcile newest desired state.
+
+        reconcileMegaOutputs();
+
+
+        continue;
+      }
+    }
+
+
     if (
       now -
       pending.sentAt <
@@ -1649,7 +1596,7 @@ void retryMegaCommands() {
 
 
     // ========================================================
-    // FAILED AFTER INITIAL + 2 RETRIES
+    // FAILED
     // ========================================================
 
     bool target =
@@ -1672,11 +1619,44 @@ void retryMegaCommands() {
       !wasResync
     ) {
 
-      sendGigaFailure(
-        i,
-        target,
-        "MEGA_NO_ACK"
-      );
+      // ------------------------------------------------------
+      // Only report failure if this target is STILL desired.
+      // ------------------------------------------------------
+
+      bool stillDesired;
+
+
+      if (
+        isTACommand(
+          i
+        )
+      ) {
+
+        stillDesired =
+          (
+            desiredTAMode ==
+            i
+          ) ==
+          target;
+
+      } else {
+
+        stillDesired =
+          effectiveState[i] ==
+          target;
+      }
+
+
+      if (
+        stillDesired
+      ) {
+
+        sendGigaFailure(
+          i,
+          target,
+          "MEGA_NO_ACK"
+        );
+      }
     }
 
 
@@ -1692,7 +1672,7 @@ void retryMegaCommands() {
 
 
 // ============================================================
-// MEGA SERIAL RECEIVE
+// MEGA SERIAL
 // ============================================================
 
 void handleMegaSerial() {
@@ -1764,7 +1744,7 @@ void handleMegaSerial() {
 
 
 // ============================================================
-// PROCESS MEGA MESSAGE
+// PROCESS MEGA LINE
 // ============================================================
 
 void processMegaLine(
@@ -1782,7 +1762,7 @@ void processMegaLine(
 
 
   // ----------------------------------------------------------
-  // Forward diagnostics to GIGA.
+  // Forward Mega diagnostics to GIGA.
   // ----------------------------------------------------------
 
   if (
@@ -1985,7 +1965,7 @@ void processMegaLine(
     }
 
 
-    bool state =
+    bool ackState =
       strcasecmp(
         action,
         "START"
@@ -1996,19 +1976,112 @@ void processMegaLine(
       megaPending[command];
 
 
-    // --------------------------------------------------------
-    // Ignore unrelated/stale ACK.
-    // --------------------------------------------------------
+    // ========================================================
+    // ACK DOES NOT MATCH CURRENT PENDING TRANSACTION
+    //
+    // Treat it as a stale ACK.
+    //
+    // IMPORTANT:
+    // We do NOT let an unrelated ACK complete the newer
+    // transaction.
+    // ========================================================
 
     if (
       !pending.active ||
       pending.targetState !=
-      state
+      ackState
     ) {
+
+      // ------------------------------------------------------
+      // We still learned something:
+      // Mega says this output just reached ackState.
+      // ------------------------------------------------------
+
+      if (
+        isTACommand(
+          command
+        )
+      ) {
+
+        if (
+          ackState
+        ) {
+
+          confirmedTAMode =
+            command;
+
+
+          megaConfirmedState[
+            CMD_TLEFT
+          ] =
+            command ==
+            CMD_TLEFT;
+
+
+          megaConfirmedState[
+            CMD_TRIGHT
+          ] =
+            command ==
+            CMD_TRIGHT;
+
+
+          megaConfirmedState[
+            CMD_TOUT
+          ] =
+            command ==
+            CMD_TOUT;
+
+        } else {
+
+          megaConfirmedState[
+            command
+          ] =
+            false;
+
+
+          if (
+            confirmedTAMode ==
+            command
+          ) {
+
+            confirmedTAMode =
+              -1;
+          }
+        }
+
+      } else {
+
+        megaConfirmedState[
+          command
+        ] =
+          ackState;
+      }
+
+
+      // ------------------------------------------------------
+      // DO NOT SEND GIGA CONFIRMED.
+      //
+      // Instead immediately compare this stale Mega state
+      // against the newest desired state.
+      // ------------------------------------------------------
+
+      reconcileAfterMegaAck(
+        command
+      );
+
+
+      sendGigaState(
+        command
+      );
+
 
       return;
     }
 
+
+    // ========================================================
+    // ACK MATCHES CURRENT PENDING TRANSACTION
+    // ========================================================
 
     bool wasResync =
       pending.partOfResync;
@@ -2023,7 +2096,7 @@ void processMegaLine(
 
 
     // --------------------------------------------------------
-    // TA CONFIRMATION
+    // Record what Mega actually confirmed.
     // --------------------------------------------------------
 
     if (
@@ -2033,7 +2106,7 @@ void processMegaLine(
     ) {
 
       if (
-        state
+        ackState
       ) {
 
         confirmedTAMode =
@@ -2083,25 +2156,60 @@ void processMegaLine(
       megaConfirmedState[
         command
       ] =
-        state;
+        ackState;
     }
 
 
     // --------------------------------------------------------
-    // Normal command confirmation to GIGA.
+    // Recalculate CURRENT desired state now.
     //
-    // Only report confirmation if current GIGA request is
-    // actually consistent with this transaction.
-    //
-    // Physical-only changes simply update STATE.
+    // This is important because GIGA or physical state may
+    // have changed after command was originally sent.
     // --------------------------------------------------------
 
+    updateEffectiveStates();
+
+
+    bool currentDesired;
+
+
     if (
-      !wasResync
+      isTACommand(
+        command
+      )
     ) {
 
+      currentDesired =
+        desiredTAMode ==
+        command;
+
+    } else {
+
+      currentDesired =
+        effectiveState[
+          command
+        ];
+    }
+
+
+    // ========================================================
+    // ONLY CURRENT ACK MAY CONFIRM GIGA
+    // ========================================================
+
+    if (
+      !wasResync &&
+      ackState ==
+      currentDesired
+    ) {
+
+      // ------------------------------------------------------
+      // START confirmation:
+      //
+      // GIGA must CURRENTLY be requesting START.
+      // ------------------------------------------------------
+
       if (
-        state &&
+        ackState &&
         gigaRequest[command]
       ) {
 
@@ -2112,8 +2220,14 @@ void processMegaLine(
       }
 
 
+      // ------------------------------------------------------
+      // STOP confirmation:
+      //
+      // GIGA must CURRENTLY be requesting STOP.
+      // ------------------------------------------------------
+
       else if (
-        !state &&
+        !ackState &&
         !gigaRequest[command]
       ) {
 
@@ -2125,17 +2239,40 @@ void processMegaLine(
     }
 
 
+    // --------------------------------------------------------
+    // Send authoritative state.
+    // --------------------------------------------------------
+
     sendGigaState(
       command
     );
 
+
+    // ========================================================
+    // RESYNC
+    // ========================================================
 
     if (
       wasResync
     ) {
 
       megaResyncIndex++;
+
+
+      return;
     }
+
+
+    // ========================================================
+    // IMMEDIATELY CORRECT STALE RESULT
+    //
+    // If desired state changed while Mega was processing the
+    // command, this sends the opposite command immediately.
+    // ========================================================
+
+    reconcileAfterMegaAck(
+      command
+    );
 
 
     return;
@@ -2144,7 +2281,7 @@ void processMegaLine(
 
 
 // ============================================================
-// GIGA SERIAL RECEIVE
+// GIGA SERIAL
 // ============================================================
 
 void handleGigaSerial() {
@@ -2216,7 +2353,7 @@ void handleGigaSerial() {
 
 
 // ============================================================
-// PROCESS GIGA MESSAGE
+// PROCESS GIGA LINE
 // ============================================================
 
 void processGigaLine(
@@ -2261,10 +2398,6 @@ void processGigaLine(
     );
 
 
-    // --------------------------------------------------------
-    // Send boot notice once per Nano boot.
-    // --------------------------------------------------------
-
     if (
       !bootNoticeSentToGiga
     ) {
@@ -2279,16 +2412,11 @@ void processGigaLine(
     }
 
 
-    // --------------------------------------------------------
-    // Reconnection state.
-    // --------------------------------------------------------
-
     if (
       wasDisconnected
     ) {
 
       sendAllGigaStates();
-
 
       sendGigaLinkState();
     }
@@ -2299,7 +2427,7 @@ void processGigaLine(
 
 
   // ----------------------------------------------------------
-  // Ignore command traffic until GIGA heartbeat exists.
+  // Ignore command traffic until heartbeat established.
   // ----------------------------------------------------------
 
   if (
@@ -2311,7 +2439,7 @@ void processGigaLine(
 
 
   // ==========================================================
-  // SYNC REQUEST
+  // SYNC
   // ==========================================================
 
   if (
@@ -2323,19 +2451,14 @@ void processGigaLine(
 
     sendAllGigaStates();
 
-
     sendGigaLinkState();
-
 
     return;
   }
 
 
   // ==========================================================
-  // PHYSICAL OVERRIDE
-  //
-  // OVERRIDE OUTERS ON
-  // OVERRIDE OUTERS OFF
+  // OVERRIDE
   // ==========================================================
 
   if (
@@ -2385,10 +2508,6 @@ void processGigaLine(
       ) == 0;
 
 
-    // --------------------------------------------------------
-    // ACK means Nano received and parsed the request.
-    // --------------------------------------------------------
-
     char ack[80];
 
 
@@ -2409,7 +2528,7 @@ void processGigaLine(
 
 
     // --------------------------------------------------------
-    // ON is only valid if physical switch is actually ON.
+    // Cannot override a physical source that isn't ON.
     // --------------------------------------------------------
 
     if (
@@ -2430,19 +2549,11 @@ void processGigaLine(
     }
 
 
-    // --------------------------------------------------------
-    // Apply override.
-    // --------------------------------------------------------
-
     setPhysicalOverride(
       command,
       enable
     );
 
-
-    // --------------------------------------------------------
-    // Confirmation means Nano arbitration accepted it.
-    // --------------------------------------------------------
 
     char confirmed[96];
 
@@ -2502,10 +2613,6 @@ void processGigaLine(
     }
 
 
-    // --------------------------------------------------------
-    // Immediate Nano ACK.
-    // --------------------------------------------------------
-
     char ack[64];
 
 
@@ -2530,12 +2637,6 @@ void processGigaLine(
       true;
 
 
-    // --------------------------------------------------------
-    // New TA activation gets newest order.
-    //
-    // Duplicate retry does NOT keep stealing priority.
-    // --------------------------------------------------------
-
     if (
       isTACommand(
         command
@@ -2552,13 +2653,34 @@ void processGigaLine(
 
 
     // --------------------------------------------------------
-    // If desired output is already confirmed because another
-    // source had it active, immediately confirm GIGA.
+    // If output is ALREADY in correct state, no Mega command
+    // is necessary.
     // --------------------------------------------------------
 
+    bool alreadyCorrect;
+
+
     if (
-      megaConfirmedState[command] &&
-      effectiveState[command]
+      isTACommand(
+        command
+      )
+    ) {
+
+      alreadyCorrect =
+        confirmedTAMode ==
+        command;
+
+    } else {
+
+      alreadyCorrect =
+        megaConfirmedState[
+          command
+        ];
+    }
+
+
+    if (
+      alreadyCorrect
     ) {
 
       sendGigaConfirmation(
@@ -2566,22 +2688,45 @@ void processGigaLine(
         true
       );
 
+    } else if (
+      megaLinkLost
+    ) {
+
+      sendGigaFailure(
+        command,
+        true,
+        "MEGA_LINK_LOST"
+      );
+
     } else {
 
+      // ------------------------------------------------------
+      // IMPORTANT:
+      //
+      // If an opposite command is currently pending, cancel it
+      // now. Do not wait for retry logic.
+      // ------------------------------------------------------
+
       if (
-        megaLinkLost
+        megaPending[
+          command
+        ].active &&
+        megaPending[
+          command
+        ].targetState == false &&
+        !megaPending[
+          command
+        ].partOfResync
       ) {
 
-        sendGigaFailure(
-          command,
-          true,
-          "MEGA_LINK_LOST"
-        );
-
-      } else {
-
-        reconcileMegaOutputs();
+        megaPending[
+          command
+        ].active =
+          false;
       }
+
+
+      reconcileMegaOutputs();
     }
 
 
@@ -2659,36 +2804,79 @@ void processGigaLine(
 
 
     // --------------------------------------------------------
-    // Merged-source semantics:
-    //
-    // If physical source still keeps output active, GIGA STOP
-    // itself is considered satisfied without unnecessarily
-    // stopping the physical output.
+    // Cancel obsolete pending START immediately.
     // --------------------------------------------------------
 
     if (
-      effectiveState[command]
+      megaPending[
+        command
+      ].active &&
+      megaPending[
+        command
+      ].targetState == true &&
+      !megaPending[
+        command
+      ].partOfResync
+    ) {
+
+      megaPending[
+        command
+      ].active =
+          false;
+    }
+
+
+    // --------------------------------------------------------
+    // If another source still wants output active, GIGA's STOP
+    // request itself is satisfied without turning physical
+    // source off.
+    // --------------------------------------------------------
+
+    if (
+      effectiveState[
+        command
+      ]
     ) {
 
       sendGigaConfirmation(
         command,
         false
       );
-
-
-    } else if (
-      !megaConfirmedState[command]
-    ) {
-
-      sendGigaConfirmation(
-        command,
-        false
-      );
-
 
     } else {
 
+      bool alreadyOff;
+
+
       if (
+        isTACommand(
+          command
+        )
+      ) {
+
+        alreadyOff =
+          confirmedTAMode !=
+          command;
+
+      } else {
+
+        alreadyOff =
+          !megaConfirmedState[
+            command
+          ];
+      }
+
+
+      if (
+        alreadyOff
+      ) {
+
+        sendGigaConfirmation(
+          command,
+          false
+        );
+
+      } else if (
         megaLinkLost
       ) {
 
@@ -2716,7 +2904,7 @@ void processGigaLine(
 
 
 // ============================================================
-// SEND ONE STATE TO GIGA
+// SEND STATE
 // ============================================================
 
 void sendGigaState(
@@ -2784,7 +2972,7 @@ void sendGigaState(
 
 
 // ============================================================
-// SEND FULL STATE SYNC
+// SEND FULL STATE
 // ============================================================
 
 void sendAllGigaStates() {
@@ -2821,7 +3009,7 @@ void sendAllGigaStates() {
 
 
 // ============================================================
-// SEND CURRENT MEGA LINK STATE
+// SEND LINK STATE
 // ============================================================
 
 void sendGigaLinkState() {
@@ -2852,7 +3040,7 @@ void sendGigaLinkState() {
 
 
 // ============================================================
-// SEND GIGA CONFIRMATION
+// SEND CONFIRMATION
 // ============================================================
 
 void sendGigaConfirmation(
@@ -2889,7 +3077,7 @@ void sendGigaConfirmation(
 
 
 // ============================================================
-// SEND GIGA FAILURE
+// SEND FAILURE
 // ============================================================
 
 void sendGigaFailure(
@@ -2928,7 +3116,7 @@ void sendGigaFailure(
 
 
 // ============================================================
-// CLEAR ALL GIGA REQUESTS
+// CLEAR GIGA REQUESTS
 // ============================================================
 
 void clearAllGigaRequests() {
@@ -2953,7 +3141,7 @@ void clearAllGigaRequests() {
 
 
 // ============================================================
-// SEND MEGA HEARTBEAT
+// MEGA HEARTBEAT
 // ============================================================
 
 void sendMegaHeartbeat() {
@@ -2993,7 +3181,7 @@ void sendMegaHeartbeat() {
 
 
 // ============================================================
-// UPDATE MEGA WATCHDOG
+// MEGA WATCHDOG
 // ============================================================
 
 void updateMegaWatchdog() {
@@ -3023,7 +3211,7 @@ void updateMegaWatchdog() {
 
 
 // ============================================================
-// MARK MEGA LOST
+// MEGA LOST
 // ============================================================
 
 void markMegaLost() {
@@ -3044,10 +3232,6 @@ void markMegaLost() {
     -1;
 
 
-  // ----------------------------------------------------------
-  // Invalidate all confirmations.
-  // ----------------------------------------------------------
-
   for (
     int i = 0;
     i < NUM_COMMANDS;
@@ -3063,11 +3247,42 @@ void markMegaLost() {
       !megaPending[i].partOfResync
     ) {
 
-      sendGigaFailure(
-        i,
-        megaPending[i].targetState,
-        "MEGA_LINK_LOST"
-      );
+      // ------------------------------------------------------
+      // Only fail current transaction if target still matches
+      // current desired state.
+      // ------------------------------------------------------
+
+      bool currentDesired;
+
+
+      if (
+        isTACommand(
+          i
+        )
+      ) {
+
+        currentDesired =
+          desiredTAMode ==
+          i;
+
+      } else {
+
+        currentDesired =
+          effectiveState[i];
+      }
+
+
+      if (
+        megaPending[i].targetState ==
+        currentDesired
+      ) {
+
+        sendGigaFailure(
+          i,
+          megaPending[i].targetState,
+          "MEGA_LINK_LOST"
+        );
+      }
     }
 
 
@@ -3095,7 +3310,7 @@ void markMegaLost() {
 
 
 // ============================================================
-// MARK MEGA RESTORED
+// MEGA RESTORED
 // ============================================================
 
 void markMegaRestored() {
@@ -3137,7 +3352,7 @@ void markMegaRestored() {
 
 
 // ============================================================
-// START MEGA FULL RESYNC
+// START MEGA RESYNC
 // ============================================================
 
 void startMegaResync() {
@@ -3152,10 +3367,6 @@ void startMegaResync() {
   megaResyncIndex =
     0;
 
-
-  // ----------------------------------------------------------
-  // We no longer trust previous Mega state.
-  // ----------------------------------------------------------
 
   confirmedTAMode =
     -1;
@@ -3174,7 +3385,7 @@ void startMegaResync() {
 
 
 // ============================================================
-// CONTINUE FULL MEGA RESYNC
+// CONTINUE MEGA RESYNC
 // ============================================================
 
 void continueMegaResync() {
@@ -3200,7 +3411,7 @@ void continueMegaResync() {
 
 
   // ----------------------------------------------------------
-  // Wait for current resync command ACK.
+  // Wait for current resync command.
   // ----------------------------------------------------------
 
   for (
@@ -3220,7 +3431,7 @@ void continueMegaResync() {
 
 
   // ----------------------------------------------------------
-  // RESYNC COMPLETE
+  // COMPLETE
   // ----------------------------------------------------------
 
   if (
@@ -3240,6 +3451,16 @@ void continueMegaResync() {
     }
 
 
+    // --------------------------------------------------------
+    // Desired state may have changed during resync.
+    // Immediately reconcile after resync completes.
+    // --------------------------------------------------------
+
+    updateEffectiveStates();
+
+    reconcileMegaOutputs();
+
+
     return;
   }
 
@@ -3248,14 +3469,8 @@ void continueMegaResync() {
     megaResyncIndex;
 
 
-  bool target =
-    effectiveState[command];
+  bool target;
 
-
-  // ----------------------------------------------------------
-  // For TA, only selected winner receives START.
-  // Others explicitly receive STOP.
-  // ----------------------------------------------------------
 
   if (
     isTACommand(
@@ -3266,6 +3481,13 @@ void continueMegaResync() {
     target =
       desiredTAMode ==
       command;
+
+  } else {
+
+    target =
+      effectiveState[
+        command
+      ];
   }
 
 
@@ -3278,7 +3500,7 @@ void continueMegaResync() {
 
 
 // ============================================================
-// CANCEL ALL MEGA PENDING COMMANDS
+// CANCEL PENDING MEGA COMMANDS
 // ============================================================
 
 void cancelMegaPending() {
@@ -3327,28 +3549,71 @@ void updateGigaWatchdog() {
   }
 
 
-  // ==========================================================
-  // GIGA LOST
-  // ==========================================================
-
   gigaConnected =
     false;
 
 
   // ----------------------------------------------------------
-  // Clear ONLY GIGA-originated requests.
+  // Clear only GIGA requests.
   //
-  // Physical requests remain.
+  // Physical switches remain.
   //
-  // Physical overrides remain while the corresponding
-  // physical switch is still ON. They are an accepted Nano
-  // arbitration state, not an active GIGA heartbeat request.
-  //
-  // Cycling the physical switch OFF automatically clears the
-  // override.
+  // Physical overrides remain latched while their physical
+  // switches remain ON.
   // ----------------------------------------------------------
 
   clearAllGigaRequests();
+
+
+  // ----------------------------------------------------------
+  // Cancel pending non-resync transactions whose target no
+  // longer matches the new physical-only desired state.
+  // ----------------------------------------------------------
+
+  for (
+    int i = 0;
+    i < NUM_COMMANDS;
+    i++
+  ) {
+
+    if (
+      !megaPending[i].active ||
+      megaPending[i].partOfResync
+    ) {
+
+      continue;
+    }
+
+
+    bool currentDesired;
+
+
+    if (
+      isTACommand(
+        i
+      )
+    ) {
+
+      currentDesired =
+        desiredTAMode ==
+        i;
+
+    } else {
+
+      currentDesired =
+        effectiveState[i];
+    }
+
+
+    if (
+      megaPending[i].targetState !=
+      currentDesired
+    ) {
+
+      megaPending[i].active =
+        false;
+    }
+  }
 
 
   reconcileMegaOutputs();
@@ -3361,7 +3626,7 @@ void updateGigaWatchdog() {
 
 
 // ============================================================
-// LOG DIAGNOSTIC TO GIGA
+// LOG TO GIGA
 // ============================================================
 
 void logToGiga(
