@@ -1,760 +1,733 @@
-GIGA Code 3 MX7000 Lightbar / Gauge Controller
+# Code 3 MX7000 Controller
+
+Custom Arduino-based controller and touchscreen interface for a **Code 3 MX7000** installed on a **1996 Ford F-350 7.3L Power Stroke**.
+
+The system uses three Arduino boards:
+
+- **Arduino Nano ESP32** — Central controller / physical switch inputs
+- **Arduino Mega 2560** — Lightbar output controller
+- **Arduino GIGA R1 WiFi + GIGA Display Shield** — Touchscreen, gauges, diagnostics, and lightbar controls
+
+---
+
+# System Layout
+
+```text
+                    PHYSICAL SWITCHES
+                           │
+                           ▼
+                  ┌─────────────────┐
+                  │   NANO ESP32    │
+                  │ Central Control │
+                  └───────┬─────────┘
+                          │
+              ┌───────────┴───────────┐
+              │                       │
+           UART                    UART
+         38,400                  38,400
+              │                       │
+              ▼                       ▼
+     ┌─────────────────┐     ┌─────────────────┐
+     │    MEGA 2560    │     │    GIGA R1      │
+     │ Output Control  │     │ Touchscreen UI  │
+     └────────┬────────┘     └─────────────────┘
+              │
+              ▼
+        RELAY / DRIVER
+              │
+              ▼
+        CODE 3 MX7000
+```
 
-Arduino GIGA R1 WiFi + GIGA Display Shield project for a vehicle-mounted Code 3 MX7000 lightbar control interface, engine gauge display, and built-in GIGA↔Nano serial monitor.
+The **Nano is the central controller**.
 
-The GIGA acts as an additional control source and display only. Physical switches remain independent through the Nano, and the Nano remains the central command/arbitration controller for the lightbar system.
+The GIGA does not directly control lightbar outputs. It sends requests to the Nano, and the Nano determines what the Mega should do.
 
-System Architecture
+---
 
-PHYSICAL SWITCHES
-      │
-      ▼
-Arduino Nano ESP32  <──── UART ────> Arduino GIGA R1 WiFi + Display
-      │
-      │ UART
-      ▼
-Arduino Mega 2560
-      │
-      ▼
-CODE 3 MX7000 LIGHTBAR
+# Arduino Nano ESP32
 
-The Nano ESP32 remains the primary controller.
+## Physical Switch Inputs
 
-The GIGA:
+All physical inputs are:
 
-* Displays engine gauges
-* Provides touchscreen lightbar controls
-* Receives physical/GIGA state information from the Nano
-* Sends commands to the Nano
-* Monitors GIGA↔Nano serial traffic internally
-* Does not directly control the Mega or lightbar outputs
+- Active LOW
+- Ground triggered
+- `INPUT_PULLUP`
+- 50 ms debounce
 
-Controller Pinouts
+| Nano Pin | Function |
+|---|---|
+| D2 | OUTERS |
+| D3 | INTERMEDIATES |
+| D4 | INNERS |
+| D5 | TRAFFICBREAKERS |
+| D6 | LEDS |
+| D7 | TLEFT |
+| D8 | TRIGHT |
+| D9 | TOUT |
+| A0 | LEFTSIGNAL |
+| A1 | RIGHTSIGNAL |
 
-Arduino GIGA R1 WiFi
+Do **NOT** apply 12 V directly to Nano GPIO pins.
 
-The GIGA currently communicates only with the Nano ESP32 for lightbar control.
+---
 
-GIGA Pin	Function	Connects To
-D0 / RX	Nano UART receive	Nano D13 / TX
-D1 / TX	Nano UART transmit	Nano D12 / RX
-GND	Common ground	Nano GND
+## Nano ↔ Mega UART
 
-Communication settings:
+**38,400 baud**
 
-GIGA Serial1
-Baud: 38400
+| Nano ESP32 | Mega 2560 |
+|---|---|
+| D10 TX | D19 RX1 |
+| D11 RX | D18 TX1 |
+| GND | GND |
 
-Wiring:
+### Important
 
-GIGA D1 TX  ─────> Nano D12 RX
-GIGA D0 RX  <───── Nano D13 TX
-GIGA GND    ────── Nano GND
+The Mega uses **5 V logic** while the Nano ESP32 uses **3.3 V logic**.
 
-The GIGA and Nano ESP32 both use 3.3 V logic.
+Therefore:
 
-The GIGA Display Shield provides the touchscreen and 800×480 display used for the gauge, lightbar, and serial-monitor interfaces.
+```text
+Nano D10 TX (3.3V)
+        │
+        └──────────────> Mega D19 RX1
 
-⸻
+Mega D18 TX (5V)
+        │
+        ▼
+ Level Shifter /
+ Resistor Divider
+        │
+        ▼
+Nano D11 RX (3.3V)
+```
 
-Arduino Nano ESP32
+Do **not** connect Mega D18 directly to Nano D11 without reducing the voltage.
 
-The Nano ESP32 is the central command controller.
+### Installed Wire Colors
 
-It:
+| Connection | Wire |
+|---|---|
+| Mega D19 RX1 | Brown |
+| Mega D18 TX1 | Yellow |
+| Ground | Green |
 
-* Reads the physical switches
-* Receives touchscreen commands from the GIGA
-* Keeps physical and GIGA requests separate
-* Performs source arbitration
-* Sends effective lightbar commands to the Mega
-* Monitors GIGA communication
-* Sends state information back to the GIGA
+---
 
-Physical Switch Inputs
+## Nano ↔ GIGA UART
 
-All physical switch inputs are active LOW.
+**38,400 baud**
 
-HIGH = OFF
-LOW  = ON / grounded
+| GIGA | Nano ESP32 |
+|---|---|
+| D1 TX | D12 RX |
+| D0 RX | D13 TX |
+| GND | GND |
 
-The inputs use:
+Both boards use 3.3 V logic, so no level shifter is required.
 
-INPUT_PULLUP
+---
 
-with approximately:
+# Arduino Mega 2560
 
-50 ms debounce
+The Mega controls the actual lightbar output drivers.
 
-Nano Pin	Function
-D2	OUTERS
-D3	INTERMEDIATES
-D4	INNERS
-D5	TRAFFICBREAKERS
-D6	LEDS
-D7	TLEFT
-D8	TRIGHT
-D9	TOUT
-A0	LEFTSIGNAL
-A1	RIGHTSIGNAL
+Outputs are **active LOW**:
 
-Nano ↔ Mega UART
+```text
+LOW  = Output ON
+HIGH = Output OFF
+```
 
-Nano Pin	Function	Connects To
-D10	TX to Mega	Mega D19 / RX1
-D11	RX from Mega	Mega D18 / TX1
-GND	Common ground	Mega GND
+The Arduino pins should operate suitable relays/MOSFET drivers.
 
-Nano firmware uses:
+They should **NOT directly power the lightbar loads**.
 
-HardwareSerial MegaSerial(1);
+---
 
-Communication speed:
+## Traffic Advisor Outputs
 
-38400 baud
+| Mega Pin | Function |
+|---|---|
+| D23 | TA1 — Far Left |
+| D25 | TA2 |
+| D27 | TA3 |
+| D29 | TA4 |
+| D31 | TA5 |
+| D33 | TA6 |
+| D35 | TA7 |
+| D37 | TA8 — Far Right |
 
-Wiring:
+---
 
-Nano D10 TX ─────> Mega D19 RX1
-Nano D11 RX <───── Mega D18 TX1
-                  │
-                  └── LEVEL SHIFT / VOLTAGE DIVIDER REQUIRED
-Nano GND    ────── Mega GND
+## Main Lightbar Outputs
 
-Important: The Mega 2560 TX output is 5 V logic while the Nano ESP32 uses 3.3 V GPIO.
+| Mega Pin | Function |
+|---|---|
+| D39 | TRAFFICBREAKERS |
+| D41 | OUTERS |
+| D43 | INTERMEDIATES |
+| D45 | INNERS |
+| D47 | LEDS |
+| D49 | Unassigned |
+| D51 | Unused |
+| D53 | Unused |
 
-A suitable level shifter or voltage divider must therefore be installed between:
+---
 
-Mega D18 TX1
-     ↓
-Nano D11 RX
+## Physical Relay Wiring Reference
 
-The Nano’s 3.3 V TX signal is generally sufficient for the Mega’s RX input.
+These colors are only installation/wiring references.
 
-Nano ↔ GIGA UART
+They have **no meaning in the software**.
 
-Nano Pin	Function	Connects To
-D12	RX from GIGA	GIGA D1 / TX
-D13	TX to GIGA	GIGA D0 / RX
-GND	Common ground	GIGA GND
+### Set 1
 
-Nano firmware uses:
+| Mega Pin | Wire |
+|---|---|
+| D23 | Green |
+| D25 | Red |
+| D27 | White |
+| D29 | Black |
 
-HardwareSerial GigaSerial(2);
+### Set 2
 
-Communication speed:
+| Mega Pin | Wire |
+|---|---|
+| D31 | Green |
+| D33 | Red |
+| D35 | White |
+| D37 | Black |
 
-38400 baud
+### Set 3
 
-Relevant Nano ESP32 GPIO Mapping
+| Mega Pin | Wire |
+|---|---|
+| D39 | Green |
+| D41 | Red |
+| D43 | White |
+| D45 | Black |
 
-Nano Pin	ESP32 GPIO
-D10	GPIO21
-D11	GPIO38
-D12	GPIO47
-D13	GPIO48
-A0	GPIO1
-A1	GPIO2
+### Set 4
 
-D12 and D13 are reserved in this project for GIGA UART communication.
+| Connection | Wire |
+|---|---|
+| D47 | Green |
+| +5 V | Red |
+| D49 | White |
+| 5 V Ground | Black |
 
-D13 / GPIO48 is also associated with LED_BUILTIN / SPI SCK, and D12 is associated with SPI CIPO. Those default functions should not be used simultaneously with the GIGA UART configuration.
+---
 
-⸻
+# Arduino GIGA R1 WiFi
 
-Arduino Mega 2560
+The GIGA uses the **GIGA Display Shield** as the user interface.
 
-The Mega controls the physical Code 3 MX7000 lightbar outputs.
+It provides:
 
-The Mega receives commands from the Nano and handles:
+- 7.3 Power Stroke gauges
+- Lightbar touchscreen controls
+- Physical-switch status
+- Communication status
+- Serial monitor
+- Startup logo
+- Physical switch override controls
 
-* Direct lightbar outputs
-* Traffic Advisor sequencing
-* Turn signal outputs
-* Traffic Advisor priority over turn signals
-* Nano heartbeat monitoring
-* Output shutdown if Nano communication is lost
+The GIGA does **not directly drive the MX7000**.
 
-Nano Communication
+Commands go:
 
-Mega Pin	Function	Connects To
-D18 / TX1	TX to Nano	Nano D11 / RX through level shifting
-D19 / RX1	RX from Nano	Nano D10 / TX
-GND	Common ground	Nano GND
-
-Communication:
-
-Mega Serial1
-38400 baud
-
-Traffic Advisor Outputs
-
-Mega Pin	Output
-D23	TA1 — Far Left
-D25	TA2
-D27	TA3
-D29	TA4
-D31	TA5
-D33	TA6
-D35	TA7
-D37	TA8 — Far Right
-
-Traffic Advisor layout:
-
-LEFT                                         RIGHT
-TA1   TA2   TA3   TA4   TA5   TA6   TA7   TA8
- │     │     │     │     │     │     │     │
-D23   D25   D27   D29   D31   D33   D35   D37
-
-Direct Lightbar Outputs
-
-Mega Pin	Code 3 MX7000 Function
-D39	TRAFFICBREAKERS
-D41	OUTERS
-D43	INTERMEDIATES
-D45	INNERS
-D47	LEDS
-D49	Unused
-D51	Unused
-D53	Unused
-
-The outputs are currently configured as active LOW:
-
-OUTPUT_ON  = LOW;
-OUTPUT_OFF = HIGH;
-
-The Mega GPIO pins must not directly power the lightbar loads.
-
-The Mega outputs should control suitable:
-
-MOSFETs
-Transistors
-Relay/driver circuits
-or other appropriate automotive output drivers
-
-depending on the final lightbar interface hardware.
-
-Complete Communication Overview
-
-                 3.3 V UART
-       ┌───────────────────────────┐
-       │                           │
-       │                           ▼
-┌──────────────┐             ┌──────────────┐
-│              │             │              │
-│  Nano ESP32  │             │  GIGA R1     │
-│              │             │  + Display   │
-└──────┬───────┘             └──────────────┘
-       │
-       │ UART
-       │
-       │ Nano D10 TX ───────> Mega D19 RX1
-       │ Nano D11 RX <─────── Mega D18 TX1
-       │                       through level shifting
-       ▼
-┌──────────────┐
-│              │
-│ Mega 2560    │
-│              │
-└──────┬───────┘
-       │
-       │ Output drivers
-       ▼
-┌─────────────────────────┐
-│                         │
-│ CODE 3 MX7000 LIGHTBAR  │
-│                         │
-└─────────────────────────┘
-
-Display Screens
-
-The GIGA currently has three screens.
-
-1. Engine Gauges
-
-The default screen displays two gauges:
-
-* IPR Duty Cycle
-    * Range: 0–100%
-* ICP Pressure
-    * Range: 0–4000 PSI
-
-The analog needles use smoothing:
-
-displayedIPR +=
-  (actualIPR - displayedIPR) * 0.15f;
-displayedICP +=
-  (actualICP - displayedICP) * 0.15f;
-
-The digital values remain unsmoothed.
-
-The current engine values are simulated for development.
-
-Future vehicle diagnostic code will replace the engine-data source without requiring the rest of the display code to be redesigned.
-
-Engine Vehicle Target
-
-Current target vehicle:
-
-1996 Ford F-350
-7.3L Power Stroke
-
-Planned diagnostic values:
-
-IPR Duty Cycle
-ICP Pressure
-
-The 1996 7.3 Power Stroke uses Ford’s SAE J1850 PWM/SCP-era diagnostic system rather than modern CAN.
-
-Actual J1850 diagnostic support has not yet been implemented.
-
-2. Lightbar Control Screen
-
-The touchscreen supports the following commands:
-
-OUTERS
-INTERMEDIATES
-INNERS
-TRAFFICBREAKERS
-LEDS
-TLEFT
-TRIGHT
-TOUT
-LEFTSIGNAL
-RIGHTSIGNAL
-
-The GIGA does not directly activate lightbar outputs.
-
-Instead:
-
+```text
 GIGA
   │
-  │ START / STOP command
   ▼
-Nano ESP32
-  │
-  │ arbitration
-  ▼
-Mega 2560
+NANO
   │
   ▼
-Code 3 MX7000 Lightbar
-
-Lightbar Button Colors
-
-The lightbar screen uses color-only status indications.
-
-Dark
-
-Inactive
-
-Blue
-
-Physical Nano switch is active
-
-Green
-
-GIGA request is active and confirmed by the Nano
-
-Flashing Purple
-
-GIGA command did not receive an acknowledgement from the Nano
-
-If both a physical switch and a GIGA request are active at the same time, blue takes priority so the physical source remains obvious.
-
-Communication Loss Warning
-
-If the GIGA loses communication with the Nano, a flashing red border appears around the entire display.
-
-The warning is shown on:
-
-* Gauge screen
-* Lightbar screen
-* Serial monitor screen
-
-The GIGA considers the Nano offline after:
-
-15 seconds without GIGA_PONG
-
-The GIGA continues transmitting heartbeat requests so communication can recover automatically.
-
-Screen Gestures
-
-There are no permanent navigation buttons on the display.
-
-Gauges ↔ Lightbar
-
-Place two fingers on opposite horizontal sides of the display:
-
-One finger on left side
-One finger on right side
-
-Then swipe both fingers downward.
-
-Requirements:
-
-Left finger begins in outer 30%
-Right finger begins in outer 30%
-Both move at least 100 pixels downward
-
-This toggles:
-
-GAUGES
-   ↕
+MEGA
+  │
+  ▼
 LIGHTBAR
+```
 
-Serial Monitor Gesture
+---
 
-To open the built-in serial monitor:
+# GIGA Screens
 
-One finger near TOP of screen
-One finger near BOTTOM of screen
+## Startup
 
-Swipe both fingers left.
+At startup, the GIGA displays the custom DBB logo for approximately **5 seconds**.
 
-Requirements:
+Communication with the Nano can initialize while the splash screen is displayed.
 
-Top finger begins in top 30%
-Bottom finger begins in bottom 30%
-Both move at least 100 pixels left
+After the splash screen:
 
-Using the same gesture while the serial monitor is open returns to the previous normal screen.
+```text
+STARTUP LOGO
+      │
+      ▼
+GAUGE SCREEN
+```
 
-Example:
+---
 
-GAUGES
-  │
-  └── top/bottom swipe left
-             ↓
-      SERIAL MONITOR
-             │
-             └── same gesture
-                      ↓
-                   GAUGES
+## Gauge Screen
 
-If the monitor was opened from the lightbar screen, it returns to the lightbar screen.
+Displays:
 
-Built-In Serial Monitor
+- IPR — 0–100%
+- ICP — 0–4000 PSI
 
-The GIGA internally records everything it sends to and receives from the Nano.
+The current code can simulate engine data for UI testing.
 
-No additional UART hardware or passive monitoring wires are required.
+```cpp
+bool simulateEngineData = true;
+```
 
-Direction labels:
+When real truck data is implemented, this should be changed to:
 
-G>N = GIGA to Nano
-N>G = Nano to GIGA
+```cpp
+bool simulateEngineData = false;
+```
 
-Example:
+A flashing red gauge border indicates either:
 
-0000012500  G>N  GIGA_PING
-0000012510  N>G  GIGA_PONG
-0000016200  G>N  START OUTERS
-0000016210  N>G  ACK START OUTERS
-0000016220  N>G  STATE OUTERS P=0 G=1 E=1
+- Engine-data simulation is enabled
+- Real truck data has timed out
 
-The monitor stores approximately the most recent:
+Loss of Nano/Mega communication does **not** trigger the gauge-screen alarm.
 
-48 messages
+---
 
-using a circular buffer.
+## Lightbar Screen
 
-The newest messages appear at the bottom of the screen.
+Layout:
 
-Timestamps are milliseconds since GIGA startup.
+```text
+┌────────────┬────────────┬────────────┬────────────┬────────────┐
+│  TRAFFIC   │   INNERS   │ INTERMED.  │   OUTERS   │    LEDS    │
+│  BREAKER   │            │            │            │            │
+├────────────┼────────────┼────────────┼────────────┼────────────┤
+│   CLOSE    │  TA LEFT   │   TA OUT   │  TA RIGHT  │  MONITOR   │
+└────────────┴────────────┴────────────┴────────────┴────────────┘
+```
 
-GIGA ↔ Nano Protocol
+A secret two-finger downward swipe from the gauge screen opens the lightbar controller.
 
-GIGA → Nano
+`CLOSE` returns to the gauge screen.
 
-GIGA_PING
-START <COMMAND>
-STOP <COMMAND>
-SYNC_REQUEST
+`MONITOR` opens the serial monitor.
+
+The Serial Monitor `X` returns to the Lightbar screen.
+
+---
+
+# Touchscreen Button Colors
+
+| Color | Meaning |
+|---|---|
+| Dark | Inactive |
+| Flashing Blue | Physical switch ON during startup delay |
+| Blue | Physical switch active |
+| Flashing Purple | Waiting for command confirmation |
+| Solid Purple | Command failed/timed out |
+| Green | GIGA command confirmed by Mega |
+| Red | Physical switch is being suppressed by GIGA override |
+
+The green used by the lightbar controls matches the green used by the OBS-style gauges.
+
+---
+
+# Touchscreen Command Behavior
+
+A normal touchscreen command is **not sent when the finger first touches the screen**.
+
+The GIGA waits until the finger is released before executing the command.
+
+```text
+Finger Down
+     │
+     ▼
+Button Identified
+     │
+     │  No command yet
+     ▼
+Finger Released
+     │
+     ▼
+Release Confirmed
+     │
+     ▼
+Send Command ONCE
+```
+
+This helps prevent one touchscreen tap from being interpreted as multiple presses due to the behavior of the GIGA touchscreen.
+
+---
+
+# Physical Switch Priority / Override
+
+Physical switches and GIGA requests are tracked separately.
+
+Normally:
+
+```text
+Physical Request
+       OR
+GIGA Request
+       │
+       ▼
+Effective Output
+```
+
+If a physical switch is ON, its GIGA button appears **blue**.
+
+Holding that touchscreen button for approximately **2 seconds** activates the physical-switch override.
+
+The button becomes **red**.
+
+```text
+Physical Switch ON
+       │
+       ▼
+     BLUE
+       │
+   Hold ~2 sec
+       │
+       ▼
+      RED
+       │
+       ▼
+Physical contribution suppressed
+```
+
+Long-holding the red button again removes the override.
+
+Turning the physical switch OFF automatically clears its override.
+
+The override suppresses only the **physical source**. A GIGA request may still keep the same output active.
+
+---
+
+# Startup-Held Physical Switches
+
+If a physical switch is already ON when the Nano boots, the Nano recognizes it but does not immediately activate that output.
+
+The startup delay is:
+
+```text
+120 seconds
+```
+
+During this period, the corresponding GIGA button flashes blue.
+
+If the switch remains ON when the delay expires, it becomes a normal active physical request.
+
+If the physical switch is turned OFF during the delay, the startup hold is canceled.
+
+Turning it back ON is then treated as a new intentional activation.
+
+---
+
+# Traffic Advisor
+
+The Traffic Advisor uses eight outputs:
+
+```text
+TA1 TA2 TA3 TA4 TA5 TA6 TA7 TA8
+LEFT                     RIGHT
+```
+
+Sequence timing:
+
+```text
+500 ms per step
+```
+
+## Left
+
+```text
+1+2
+2+3
+3+4
+4+5
+5+6
+6+7
+7+8
+REPEAT
+```
+
+## Right
+
+```text
+8+7
+7+6
+6+5
+5+4
+4+3
+3+2
+2+1
+REPEAT
+```
+
+## Out
+
+```text
+4+5
+3+6
+2+7
+1+8
+REPEAT
+```
+
+Only one Traffic Advisor pattern is active at a time.
+
+The most recently activated eligible TA request wins.
+
+---
+
+# Turn Signals
+
+Physical turn-signal inputs:
+
+| Nano Pin | Function |
+|---|---|
+| A0 | LEFTSIGNAL |
+| A1 | RIGHTSIGNAL |
+
+When no Traffic Advisor pattern is active:
+
+```text
+LEFTSIGNAL  -> TA1
+RIGHTSIGNAL -> TA8
+```
+
+Traffic Advisor patterns have priority over the turn-signal output.
+
+When the TA pattern stops, an active turn signal can resume.
+
+---
+
+# Communication
+
+## GIGA → Nano
 
 Examples:
 
+```text
+GIGA_PING
+
 START OUTERS
-STOP TLEFT
+STOP OUTERS
+
 SYNC_REQUEST
 
-Nano → GIGA
+OVERRIDE OUTERS ON
+OVERRIDE OUTERS OFF
+```
 
+## Nano → GIGA
+
+Examples:
+
+```text
 GIGA_PONG
-ACK START <COMMAND>
-ACK STOP <COMMAND>
-SYNC_BEGIN
-STATE <COMMAND> P=<0|1> G=<0|1> E=<0|1>
-SYNC_END
-
-Example:
-
-STATE OUTERS P=1 G=0 E=1
-
-State meanings:
-
-P = physical switch request on Nano
-G = GIGA request currently stored by Nano
-E = effective state Nano is commanding toward the Mega
-
-Command Acknowledgement
-
-When the GIGA sends a command, it waits for an acknowledgement from the Nano.
-
-Example:
-
-GIGA:
-START OUTERS
-
-Expected Nano response:
 
 ACK START OUTERS
+ACK STOP OUTERS
 
-ACK timeout:
+CONFIRMED START OUTERS
+CONFIRMED STOP OUTERS
 
-1.5 seconds
+ACK OVERRIDE OUTERS ON
+CONFIRMED OVERRIDE OUTERS ON
 
-Maximum retries:
+STATE OUTERS P=1 G=0 E=1 M=1 H=0 O=0
 
-2 retries
+NANO_BOOT
 
-This means a command can be transmitted up to three times:
+MEGA_LINK_LOST
+MEGA_LINK_RESTORED
+```
 
-Original transmission
-Retry 1
-Retry 2
+---
 
-If no acknowledgement is received after all attempts, the affected button flashes purple.
-
-Duplicate commands are safe because the Nano acknowledges duplicate START/STOP requests.
-
-STATE Messages
-
-A valid STATE message is treated as authoritative.
-
-For example:
-
-STATE OUTERS P=0 G=1 E=1
-
-This tells the GIGA that:
-
-Physical switch = OFF
-GIGA request = ON
-Effective output = ON
-
-A valid STATE message also clears an ACK-failure warning because it proves the Nano received and processed the command state even if the ACK itself was lost.
-
-Synchronization
-
-After first connecting or recovering communication, the GIGA requests a complete state synchronization.
-
-Sequence:
-
-GIGA_PING
-   ↓
-GIGA_PONG
-   ↓
-SYNC_REQUEST
-   ↓
-SYNC_BEGIN
-STATE OUTERS ...
-STATE INTERMEDIATES ...
-STATE INNERS ...
-STATE TRAFFICBREAKERS ...
-STATE LEDS ...
-STATE TLEFT ...
-STATE TRIGHT ...
-STATE TOUT ...
-STATE LEFTSIGNAL ...
-STATE RIGHTSIGNAL ...
-SYNC_END
-
-This allows the GIGA display to rebuild its state from the Nano instead of assuming previous conditions.
-
-Physical Switch Independence
-
-Physical controls do not depend on the GIGA.
-
-For normal commands:
-
-Effective request =
-Physical request OR GIGA request
+# STATE Message
 
 Example:
 
-Physical ON
-GIGA OFF
-=
-ON
-Physical OFF
-GIGA ON
-=
-ON
-Physical ON
-GIGA ON
-=
-ON
-Physical OFF
-GIGA OFF
-=
-OFF
+```text
+STATE OUTERS P=1 G=0 E=1 M=1 H=0 O=0
+```
 
-If GIGA communication fails, physical switch operation remains available.
+Meaning:
 
-GIGA Failure Behavior
+| Field | Meaning |
+|---|---|
+| P | Physical request |
+| G | GIGA request |
+| E | Effective desired state |
+| M | Mega-confirmed state |
+| H | Startup hold |
+| O | Physical override |
 
-The GIGA does not force outputs off merely because communication is lost.
+The Nano's `STATE` message is the authoritative state reported to the GIGA.
 
-The Nano independently manages GIGA-originated requests.
+---
 
-The Nano’s GIGA watchdog is responsible for clearing GIGA-generated requests after its timeout period.
+# Command Confirmation
 
-Physical requests are never cleared by loss of GIGA communication.
-
-Traffic Advisor Behavior
-
-The GIGA supports:
-
-TLEFT
-TRIGHT
-TOUT
-
-Only one GIGA Traffic Advisor request is kept active at a time.
-
-When a new GIGA TA mode is selected, the GIGA sends STOP commands for its previous TA request before sending the new START request.
-
-Final arbitration still occurs on the Nano.
-
-This is important because a physical Traffic Advisor request may also be active.
-
-The Nano tracks request order and decides which active TA source has priority.
-
-Touchscreen Coordinate Mapping
-
-The GIGA Display is used in landscape orientation:
-
-display.setRotation(1);
-
-Display resolution:
-
-800 × 480
-
-Current touch transform:
-
-x = rawY;
-y = 479 - rawX;
-
-This mapping is provisional until tested on the physical Display Shield.
-
-If touch is rotated or mirrored incorrectly, the preferred solution is to modify only the touch-coordinate transform rather than changing all UI button and gesture coordinates.
-
-Current Engine Data
-
-The engine gauge values are currently generated by a simulator.
+A GIGA request travels through the complete system.
 
 Example:
 
-float ipr =
-  35.0f +
-  20.0f * sinf(seconds * 0.70f);
-float icp =
-  1200.0f +
-  900.0f * sinf(seconds * 0.45f);
+```text
+GIGA
+ │
+ │ START OUTERS
+ ▼
+NANO
+ │
+ │ ACK START OUTERS
+ ▼
+GIGA
 
-This exists only so the gauge display can be developed and tested before the J1850 interface is complete.
+NANO
+ │
+ │ START OUTERS
+ ▼
+MEGA
+ │
+ │ ACK START OUTERS
+ ▼
+NANO
+ │
+ │ CONFIRMED START OUTERS
+ ▼
+GIGA
+```
 
-Arduino Libraries
+The GIGA flashes the button purple while waiting for confirmation.
 
-The project currently uses:
+A confirmed GIGA command becomes green.
 
-#include <Arduino_GigaDisplay_GFX.h>
-#include <Arduino_GigaDisplayTouch.h>
+The GIGA retries an unconfirmed START/STOP command every:
 
-Install the corresponding Arduino GIGA Display graphics and touch libraries before compiling.
+```text
+5 seconds
+```
 
-Current Single-File Firmware
+It gives up after:
 
-The current development version is intentionally contained in one Arduino .ino file.
+```text
+30 seconds
+```
 
-This makes it easier to:
+A timed-out command becomes solid purple.
 
-* Copy into Arduino IDE
-* Compile early versions
-* Troubleshoot hardware
-* Share complete firmware
-* Make changes before final project structure is established
+---
 
-The code may later be separated into modules again once the hardware and communication system are fully tested.
+# Communication Watchdogs
 
-Current Development Status
+The system uses heartbeats so communication failures do not leave the controller blindly assuming another board is working.
 
-Implemented:
+The Nano periodically communicates with the Mega.
 
-* GIGA Display support
-* Landscape UI
-* IPR gauge
-* ICP gauge
-* Simulated engine data
-* Lightbar touchscreen controls
-* Physical/GIGA source-state display
-* Nano heartbeat
-* Nano communication-loss detection
-* Flashing red communication-loss border
-* START/STOP commands
-* Nano ACK processing
-* Automatic command retries
-* Flashing purple failed-command indication
-* Full state synchronization
-* Traffic Advisor request handling
-* Built-in GIGA↔Nano serial monitor
-* Circular serial log
-* Multi-touch screen navigation
+The GIGA periodically communicates with the Nano.
 
-Still to be tested on physical hardware:
+The Mega has its own failsafe behavior if communication with the Nano disappears.
 
-* GIGA Serial1 pin behavior with D0/D1
-* Display rendering
-* Touch coordinate orientation
-* Multi-touch gesture reliability
-* Nano↔GIGA UART operation
-* Full synchronization behavior
-* Lightbar button response
-* ACK retry behavior
+On the GIGA:
 
-Still planned:
+- Gauge alarm is reserved for truck/engine-data status.
+- Lightbar and Serial Monitor alarms indicate Nano/Mega communication problems.
 
-* SAE J1850 PWM interface
-* Real 7.3 Power Stroke IPR data
-* Real 7.3 Power Stroke ICP data
-* Vehicle testing
-* UI refinement after physical display testing
+---
 
-Important Electrical Notes
+# Serial Monitor
 
-The GIGA and Nano ESP32 use 3.3 V logic.
+The GIGA contains a built-in serial diagnostics screen.
 
-Do not connect vehicle 12 V directly to any GIGA or Nano GPIO.
+It shows traffic between the GIGA and Nano and diagnostics forwarded from the Mega.
 
-The Mega 2560 uses 5 V logic.
+Direction colors:
 
-Any Mega TX signal entering a 3.3 V device should use appropriate level shifting or voltage reduction.
+| Color | Traffic |
+|---|---|
+| Green | GIGA → Nano |
+| Blue | Nano → GIGA |
+| Red | Error |
+| Gray | Timestamp |
 
-Project Philosophy
+It also displays:
 
-The system is designed so that the touchscreen is an additional control source rather than a single point of failure.
+```text
+NANO: OK / LOST
+MEGA: OK / LOST
+```
 
-Core design goals:
+---
 
-Physical switches continue working without GIGA
-GIGA can control the same functions independently
-Nano performs source arbitration
-Mega controls the actual outputs
-Communication failures fail safely
-UI clearly identifies command source
-Troubleshooting information is available directly on the display
+# Important Electrical Notes
 
-Disclaimer
+### Nano ESP32
 
-This project is under active development and has not yet been fully verified on the final vehicle hardware.
+The Nano ESP32 is a **3.3 V device**.
 
-Bench-test all outputs, voltage levels, communication links, watchdog behavior, and touchscreen controls before connecting the system to the Code 3 MX7000 lightbar.
+Do not connect:
+
+- 12 V vehicle signals
+- 5 V Mega TX
+
+directly to its GPIO pins.
+
+### Mega Outputs
+
+Mega GPIO pins should only control appropriate driver circuitry.
+
+Do not attempt to power MX7000 lamps or other high-current loads directly from Arduino pins.
+
+### Grounds
+
+The communicating boards require a common signal ground:
+
+```text
+Nano GND
+   │
+   ├──── Mega GND
+   │
+   └──── GIGA GND
+```
+
+Use appropriate automotive electrical protection when interfacing the Arduino system with the truck's 12 V electrical system.
+
+---
+
+# Project Summary
+
+```text
+PHYSICAL SWITCHES
+       │
+       ▼
+   NANO ESP32  ◄────────►  GIGA DISPLAY
+       │                   Touchscreen
+       │                   Gauges
+       │                   Diagnostics
+       │
+       ▼
+   MEGA 2560
+       │
+       ▼
+ RELAY / DRIVER
+       │
+       ▼
+ CODE 3 MX7000
+```
+
+The main design principle is:
+
+**The Nano decides, the Mega drives, and the GIGA displays and requests.**
+
+This keeps the physical lightbar controls functional independently of the touchscreen while still allowing the GIGA to provide touchscreen control, status monitoring, diagnostics, and vehicle gauges.
