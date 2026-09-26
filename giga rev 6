@@ -12,59 +12,44 @@
   Baud: 38400
 
   ============================================================
-  SCREENS
+  SCREEN BEHAVIOR
   ============================================================
 
   GAUGE SCREEN
     - IPR 0-100 %
     - ICP 0-4000 PSI
     - Hidden two-finger downward swipe opens Lightbar
-    - Red border ONLY for:
+    - Red flashing border ONLY for:
         * simulation mode
         * truck-data timeout
 
   LIGHTBAR SCREEN
+
     Row 1:
       TRAFFIC BREAKER | INNERS | INTERMEDIATES | OUTERS | LEDS
 
     Row 2:
       CLOSE | TA LEFT | TA OUT | TA RIGHT | MONITOR
 
-    - Red border ONLY for:
-        * Nano communication lost
-        * Mega communication lost
+    Button colors:
+      DARK            = inactive
+      FLASH PURPLE    = GIGA command pending
+      FLASH PURPLE    = GIGA command failed
+      GREEN           = GIGA START confirmed by Mega
+      BLUE            = physical switch active
+      FLASH BLUE      = physical startup hold
+
+    Red flashing border ONLY for:
+      * Nano communication lost
+      * Mega communication lost
 
   SERIAL MONITOR
-    - Opened only through MONITOR
-    - X returns directly to Gauge screen
-    - Red border ONLY for:
+    - Opened from MONITOR
+    - Shows Nano and Mega communication status
+    - X returns to LIGHTBAR CONTROLLER
+    - Red flashing border ONLY for:
         * Nano communication lost
         * Mega communication lost
-
-  ============================================================
-  SECRET GESTURE
-  ============================================================
-
-  Physical DOWN = RAW X DECREASING
-
-  Gesture:
-    - requires 2 contacts to start
-    - uses average raw X
-    - tolerates brief contact dropouts
-    - 150 ms release grace
-    - 70 raw-unit downward threshold
-    - no time limit
-
-  ============================================================
-  LIGHTBAR ENTRY SAFETY
-  ============================================================
-
-  After gesture opens Lightbar:
-
-    1. Buttons locked for 1 second
-    2. Original fingers must be released
-    3. Release must last 150 ms
-    4. Only then are buttons enabled
 
   ============================================================
 */
@@ -86,11 +71,6 @@ Arduino_GigaDisplayTouch touch;
 
 GDTpoint_t touchPoints[5];
 
-
-// ============================================================
-// DISPLAY CONSTANTS
-// ============================================================
-
 const int SCREEN_W = 800;
 const int SCREEN_H = 480;
 
@@ -103,22 +83,18 @@ const uint16_t COLOR_BLACK = 0x0000;
 const uint16_t COLOR_WHITE = 0xFFFF;
 const uint16_t COLOR_RED   = 0xF800;
 
-// Period-style physical switch blue
-const uint16_t COLOR_BLUE = 0x0210;
-
-// Period-style failure purple
+// Muted period-style colors
+const uint16_t COLOR_BLUE   = 0x0210;
 const uint16_t COLOR_PURPLE = 0x4010;
 
-const uint16_t COLOR_GRAY = 0x8410;
+const uint16_t COLOR_GRAY      = 0x8410;
 const uint16_t COLOR_DARK_GRAY = 0x2104;
 
-// CLOSE / MONITOR idle color
 const uint16_t COLOR_BUTTON_IDLE = 0x1082;
 
 // OBS Ford-style instrument green
 const uint16_t COLOR_OBS_GREEN = 0x87F0;
 
-// Confirmed GIGA commands use gauge green
 const uint16_t COLOR_GREEN = COLOR_OBS_GREEN;
 
 
@@ -189,7 +165,6 @@ struct LightbarState {
   char failureReason[32];
 
   bool nanoAckPending;
-
   bool pendingStart;
 
   byte nanoRetries;
@@ -212,14 +187,18 @@ const byte MAX_NANO_RETRIES = 2;
 
 
 // ============================================================
-// HEARTBEAT
+// COMMUNICATION WATCHDOGS
 // ============================================================
 
 const unsigned long HEARTBEAT_INTERVAL = 5000;
+
 const unsigned long NANO_TIMEOUT = 15000;
+const unsigned long MEGA_TIMEOUT = 15000;
 
 unsigned long lastHeartbeatSent = 0;
+
 unsigned long lastNanoResponse = 0;
+unsigned long lastMegaResponse = 0;
 
 bool nanoLinkLost = true;
 bool megaLinkLost = true;
@@ -241,7 +220,7 @@ ScreenMode currentScreen = SCREEN_GAUGES;
 
 
 // ============================================================
-// ALARM BORDER STATE
+// ALARM BORDER
 // ============================================================
 
 bool previousAlarmBorderVisible = false;
@@ -378,7 +357,6 @@ unsigned long secretLastValidTouch = 0;
 // ============================================================
 
 const unsigned long LIGHTBAR_TOUCH_LOCKOUT = 1000;
-
 const unsigned long LIGHTBAR_RELEASE_TIME = 150;
 
 unsigned long lightbarScreenOpenedAt = 0;
@@ -407,7 +385,7 @@ const unsigned long SERIAL_SCREEN_INTERVAL = 100;
 
 
 // ============================================================
-// NANO SERIAL RECEIVE BUFFER
+// NANO RX BUFFER
 // ============================================================
 
 char nanoRxBuffer[160];
@@ -447,7 +425,6 @@ void updateEngineData();
 void markTruckDataReceived();
 
 void drawLightbarScreen();
-void drawLightbarLinkStatus();
 
 void drawLightbarButton(
   int column,
@@ -460,6 +437,7 @@ void refreshLightbarButtons();
 
 void drawSerialScreen();
 void refreshSerialScreen();
+void drawSerialLinkStatus();
 
 void addSerialMessage(
   const char *prefix,
@@ -536,11 +514,7 @@ void setup() {
   touch.begin();
 
 
-  for (
-    int i = 0;
-    i < NUM_COMMANDS;
-    i++
-  ) {
+  for (int i = 0; i < NUM_COMMANDS; i++) {
 
     lightbar[i].physical = false;
     lightbar[i].giga = false;
@@ -556,6 +530,7 @@ void setup() {
     lightbar[i].pendingStart = false;
     lightbar[i].nanoRetries = 0;
     lightbar[i].commandSentAt = 0;
+
     lightbar[i].waitingForConfirmation = false;
   }
 
@@ -573,6 +548,7 @@ void setup() {
   NanoSerial.println("GIGA_PING");
 
   lastHeartbeatSent = millis();
+
 
   addSerialMessage(
     "G>N",
@@ -650,6 +626,20 @@ void loop() {
 
 
   // ----------------------------------------------------------
+  // MEGA WATCHDOG
+  // ----------------------------------------------------------
+
+  if (
+    lastMegaResponse > 0 &&
+    now - lastMegaResponse >
+    MEGA_TIMEOUT
+  ) {
+
+    megaLinkLost = true;
+  }
+
+
+  // ----------------------------------------------------------
   // FLASH TIMER
   // ----------------------------------------------------------
 
@@ -663,13 +653,25 @@ void loop() {
     flashState = !flashState;
 
 
+    // Needed for:
+    //   - flashing purple buttons
+    //   - flashing blue startup-hold buttons
+
     if (
       currentScreen ==
       SCREEN_LIGHTBAR
     ) {
 
       refreshLightbarButtons();
-      drawLightbarLinkStatus();
+    }
+
+
+    if (
+      currentScreen ==
+      SCREEN_SERIAL
+    ) {
+
+      drawSerialLinkStatus();
     }
 
 
@@ -760,9 +762,6 @@ void updateEngineData() {
        engineData.icp = ...
 
        markTruckDataReceived();
-
-     The 1996 F-350 diagnostic interface is not assumed
-     to be modern CAN.
   */
 }
 
@@ -797,10 +796,8 @@ void drawGaugeScreen() {
   lightbarEntryTouchReleased =
     true;
 
-
   lightbarNoTouchSince =
     0;
-
 
   buttonTouchActive =
     true;
@@ -831,7 +828,7 @@ void drawGaugeScreen() {
   updateGaugeDisplay();
 
 
-  // Force border redraw for new screen
+  // Force border redraw
 
   previousAlarmBorderScreen =
     SCREEN_LIGHTBAR;
@@ -1278,7 +1275,7 @@ void updateGaugeDisplay() {
 
 
 // ============================================================
-// DRAW NEEDLE
+// DRAW GAUGE NEEDLE
 // ============================================================
 
 void drawGaugeNeedle(
@@ -1487,7 +1484,7 @@ void handleTouch() {
 
 
   // ----------------------------------------------------------
-  // LIGHTBAR ENTRY RELEASE MONITOR
+  // LIGHTBAR ENTRY RELEASE
   // ----------------------------------------------------------
 
   if (
@@ -1571,7 +1568,7 @@ void handleTouch() {
 
 
   // ----------------------------------------------------------
-  // SERIAL MONITOR
+  // SERIAL
   // ----------------------------------------------------------
 
   else if (
@@ -1599,10 +1596,6 @@ void handleSecretGesture(
   unsigned long now =
     millis();
 
-
-  // ----------------------------------------------------------
-  // TWO VALID CONTACTS
-  // ----------------------------------------------------------
 
   if (
     contacts >= 2
@@ -1636,7 +1629,7 @@ void handleSecretGesture(
 
 
     // --------------------------------------------------------
-    // BEGIN GESTURE
+    // START GESTURE
     // --------------------------------------------------------
 
     if (
@@ -1676,7 +1669,7 @@ void handleSecretGesture(
 
 
     // --------------------------------------------------------
-    // CONTINUE GESTURE
+    // TRACK DOWNWARD MOVEMENT
     // --------------------------------------------------------
 
     if (
@@ -1723,7 +1716,7 @@ void handleSecretGesture(
 
 
   // ----------------------------------------------------------
-  // TEMPORARY CONTACT DROPOUT
+  // CONTACT DROPOUT
   // ----------------------------------------------------------
 
   if (
@@ -1781,10 +1774,6 @@ void updateLightbarEntryRelease(
     millis();
 
 
-  // ----------------------------------------------------------
-  // STILL TOUCHED
-  // ----------------------------------------------------------
-
   if (
     contacts > 0
   ) {
@@ -1796,10 +1785,6 @@ void updateLightbarEntryRelease(
   }
 
 
-  // ----------------------------------------------------------
-  // FIRST ZERO-CONTACT SAMPLE
-  // ----------------------------------------------------------
-
   if (
     lightbarNoTouchSince == 0
   ) {
@@ -1810,10 +1795,6 @@ void updateLightbarEntryRelease(
     return;
   }
 
-
-  // ----------------------------------------------------------
-  // TRUE RELEASE
-  // ----------------------------------------------------------
 
   if (
     now -
@@ -1864,7 +1845,7 @@ bool lightbarTouchEnabled() {
 
 
 // ============================================================
-// NORMAL TOUCH MAPPING
+// TOUCH MAPPING
 // ============================================================
 
 void mapTouchPoint(
@@ -1893,7 +1874,7 @@ void drawLightbarScreen() {
 
 
   // ----------------------------------------------------------
-  // ENTRY SAFETY LOCK
+  // ENTRY SAFETY
   // ----------------------------------------------------------
 
   lightbarScreenOpenedAt =
@@ -1913,7 +1894,7 @@ void drawLightbarScreen() {
 
 
   // ----------------------------------------------------------
-  // SCREEN
+  // DRAW SCREEN
   // ----------------------------------------------------------
 
   display.fillScreen(
@@ -1943,10 +1924,8 @@ void drawLightbarScreen() {
 
   refreshLightbarButtons();
 
-  drawLightbarLinkStatus();
 
-
-  // Force alarm border to evaluate for this screen.
+  // Force alarm border redraw
 
   previousAlarmBorderScreen =
     SCREEN_GAUGES;
@@ -1956,104 +1935,6 @@ void drawLightbarScreen() {
 
 
   updateAlarmBorder();
-}
-
-
-// ============================================================
-// LIGHTBAR LINK STATUS
-// ============================================================
-//
-// TEMPORARY DEBUG DISPLAY.
-//
-// If the border is flashing while this says:
-//
-//     N:OK M:OK
-//
-// then the communication flags are not causing the flashing
-// and we know the problem is purely display/render related.
-//
-// ============================================================
-
-void drawLightbarLinkStatus() {
-
-  display.fillRect(
-    580,
-    15,
-    205,
-    30,
-    COLOR_BLACK
-  );
-
-
-  display.setTextSize(2);
-
-
-  display.setTextColor(
-    COLOR_OBS_GREEN,
-    COLOR_BLACK
-  );
-
-
-  display.setCursor(
-    580,
-    20
-  );
-
-
-  display.print("N:");
-
-
-  if (
-    nanoLinkLost
-  ) {
-
-    display.setTextColor(
-      COLOR_RED,
-      COLOR_BLACK
-    );
-
-    display.print("LOST");
-
-  } else {
-
-    display.setTextColor(
-      COLOR_OBS_GREEN,
-      COLOR_BLACK
-    );
-
-    display.print("OK");
-  }
-
-
-  display.setTextColor(
-    COLOR_OBS_GREEN,
-    COLOR_BLACK
-  );
-
-
-  display.print(" M:");
-
-
-  if (
-    megaLinkLost
-  ) {
-
-    display.setTextColor(
-      COLOR_RED,
-      COLOR_BLACK
-    );
-
-    display.print("LOST");
-
-  } else {
-
-    display.setTextColor(
-      COLOR_OBS_GREEN,
-      COLOR_BLACK
-    );
-
-    display.print("OK");
-  }
 }
 
 
@@ -2242,6 +2123,7 @@ void drawLightbarButton(
       y + 50
     );
 
+
     display.print(
       "TRAFFIC"
     );
@@ -2251,6 +2133,7 @@ void drawLightbarButton(
       x + 22,
       y + 78
     );
+
 
     display.print(
       "BREAKER"
@@ -2302,7 +2185,7 @@ void drawLightbarButton(
 
 
 // ============================================================
-// BUTTON COLOR
+// BUTTON COLOR / COMMAND STATUS
 // ============================================================
 
 uint16_t getButtonColor(
@@ -2313,60 +2196,77 @@ uint16_t getButtonColor(
     lightbar[command];
 
 
-  // ----------------------------------------------------------
-  // PHYSICAL SOURCE
-  // ----------------------------------------------------------
+  // ==========================================================
+  // 1. PHYSICAL SWITCH HAS HIGHEST VISUAL PRIORITY
+  // ==========================================================
 
   if (
     s.physical
   ) {
 
-    // Startup hold = flashing blue
+    // --------------------------------------------------------
+    // STARTUP HOLD
+    // --------------------------------------------------------
 
     if (
       s.startupHold
     ) {
 
-      if (
-        flashState
-      ) {
-
-        return COLOR_BLUE;
-      }
-
-
-      return COLOR_BLACK;
+      return flashState ?
+        COLOR_BLUE :
+        COLOR_BLACK;
     }
 
+
+    // --------------------------------------------------------
+    // NORMAL PHYSICAL ACTIVATION
+    // --------------------------------------------------------
 
     return COLOR_BLUE;
   }
 
 
-  // ----------------------------------------------------------
-  // FAILED GIGA REQUEST
-  // ----------------------------------------------------------
+  // ==========================================================
+  // 2. WAITING FOR CONFIRMATION
+  // ==========================================================
+  //
+  // Immediately after START or STOP is pressed:
+  //
+  //     FLASHING PURPLE
+  //
+  // It remains flashing purple until CONFIRMED or FAILED.
+  // ==========================================================
 
   if (
-    s.giga &&
-    s.failed
+    s.waitingForConfirmation
   ) {
 
-    if (
-      flashState
-    ) {
-
-      return COLOR_PURPLE;
-    }
-
-
-    return COLOR_BLACK;
+    return flashState ?
+      COLOR_PURPLE :
+      COLOR_BLACK;
   }
 
 
-  // ----------------------------------------------------------
-  // CONFIRMED GIGA REQUEST
-  // ----------------------------------------------------------
+  // ==========================================================
+  // 3. FAILED COMMAND
+  // ==========================================================
+  //
+  // A failed GIGA command continues flashing purple.
+  // ==========================================================
+
+  if (
+    s.failed
+  ) {
+
+    return flashState ?
+      COLOR_PURPLE :
+      COLOR_BLACK;
+  }
+
+
+  // ==========================================================
+  // 4. CONFIRMED GIGA START
+  // ==========================================================
 
   if (
     s.giga &&
@@ -2376,6 +2276,10 @@ uint16_t getButtonColor(
     return COLOR_OBS_GREEN;
   }
 
+
+  // ==========================================================
+  // 5. INACTIVE
+  // ==========================================================
 
   return COLOR_BLACK;
 }
@@ -2403,7 +2307,7 @@ void handleLightbarTouch(
 
 
   // ----------------------------------------------------------
-  // COLUMN
+  // FIND COLUMN
   // ----------------------------------------------------------
 
   for (
@@ -2435,7 +2339,7 @@ void handleLightbarTouch(
 
 
   // ----------------------------------------------------------
-  // ROW
+  // FIND ROW
   // ----------------------------------------------------------
 
   for (
@@ -2554,7 +2458,7 @@ void handleLightbarTouch(
     column
   ) {
 
-    // CLOSE
+    // CLOSE -> GAUGE SCREEN
 
     case 0:
 
@@ -2638,6 +2542,13 @@ void sendGigaCommand(
     lightbar[command];
 
 
+  // ----------------------------------------------------------
+  // IMMEDIATELY ENTER PENDING STATE
+  //
+  // This causes the button to begin flashing PURPLE
+  // before we even receive the Nano ACK.
+  // ----------------------------------------------------------
+
   s.pendingStart =
     start;
 
@@ -2666,9 +2577,28 @@ void sendGigaCommand(
     '\0';
 
 
+  // Desired GIGA state changes immediately.
+
   s.giga =
     start;
 
+
+  // ----------------------------------------------------------
+  // IMMEDIATELY REFRESH BUTTON
+  // ----------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_LIGHTBAR
+  ) {
+
+    refreshLightbarButtons();
+  }
+
+
+  // ----------------------------------------------------------
+  // SEND COMMAND
+  // ----------------------------------------------------------
 
   char message[64];
 
@@ -2693,15 +2623,6 @@ void sendGigaCommand(
     "G>N",
     message
   );
-
-
-  if (
-    currentScreen ==
-    SCREEN_LIGHTBAR
-  ) {
-
-    refreshLightbarButtons();
-  }
 }
 
 
@@ -2743,6 +2664,10 @@ void retryPendingCommands() {
     }
 
 
+    // --------------------------------------------------------
+    // RETRY
+    // --------------------------------------------------------
+
     if (
       s.nanoRetries <
       MAX_NANO_RETRIES
@@ -2778,8 +2703,14 @@ void retryPendingCommands() {
         "G>N",
         message
       );
+    }
 
-    } else {
+
+    // --------------------------------------------------------
+    // FAILED
+    // --------------------------------------------------------
+
+    else {
 
       s.nanoAckPending =
         false;
@@ -2968,8 +2899,20 @@ void processNanoLine(
   char *line
 ) {
 
+  // ==========================================================
+  // ANY COMPLETE MESSAGE PROVES NANO IS ALIVE
+  // ==========================================================
+
   lastNanoResponse =
     millis();
+
+
+  bool nanoWasLost =
+    nanoLinkLost;
+
+
+  nanoLinkLost =
+    false;
 
 
   // ----------------------------------------------------------
@@ -2983,31 +2926,15 @@ void processNanoLine(
     ) == 0
   ) {
 
-    bool wasLost =
-      nanoLinkLost;
-
-
-    nanoLinkLost =
-      false;
-
-
     if (
-      wasLost
+      nanoWasLost
     ) {
 
       requestSync();
     }
 
 
-    if (
-      currentScreen ==
-      SCREEN_LIGHTBAR
-    ) {
-
-      drawLightbarLinkStatus();
-      updateAlarmBorder();
-    }
-
+    updateAlarmBorder();
 
     return;
   }
@@ -3024,12 +2951,34 @@ void processNanoLine(
     ) == 0
   ) {
 
-    nanoLinkLost =
+    requestSync();
+
+    updateAlarmBorder();
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // MEGA PONG FORWARDED BY NANO
+  // ----------------------------------------------------------
+
+  if (
+    strcmp(
+      line,
+      "DIAG M>N PONG"
+    ) == 0
+  ) {
+
+    lastMegaResponse =
+      millis();
+
+
+    megaLinkLost =
       false;
 
 
-    requestSync();
-
+    updateAlarmBorder();
 
     return;
   }
@@ -3050,15 +2999,6 @@ void processNanoLine(
       true;
 
 
-    if (
-      currentScreen ==
-      SCREEN_LIGHTBAR
-    ) {
-
-      drawLightbarLinkStatus();
-    }
-
-
     updateAlarmBorder();
 
     return;
@@ -3076,17 +3016,12 @@ void processNanoLine(
     ) == 0
   ) {
 
+    lastMegaResponse =
+      millis();
+
+
     megaLinkLost =
       false;
-
-
-    if (
-      currentScreen ==
-      SCREEN_LIGHTBAR
-    ) {
-
-      drawLightbarLinkStatus();
-    }
 
 
     updateAlarmBorder();
@@ -3097,6 +3032,11 @@ void processNanoLine(
 
   // ----------------------------------------------------------
   // ACK
+  //
+  // IMPORTANT:
+  // Nano ACK does NOT end purple flashing.
+  //
+  // We are still waiting for Mega confirmation.
   // ----------------------------------------------------------
 
   if (
@@ -3134,6 +3074,10 @@ void processNanoLine(
           index
         ].nanoAckPending =
           false;
+
+
+        // DO NOT clear waitingForConfirmation here.
+        // Purple continues until CONFIRMED or FAILED.
       }
     }
 
@@ -3212,6 +3156,15 @@ void processNanoLine(
           index
         ].failureReason[0] =
           '\0';
+
+
+        // Make sure local GIGA state agrees with
+        // the confirmed command.
+
+        lightbar[
+          index
+        ].giga =
+          start;
 
 
         if (
@@ -3452,7 +3405,7 @@ void processNanoLine(
 
 
   // ----------------------------------------------------------
-  // DIAGNOSTIC / HOLD
+  // OTHER DIAGNOSTICS
   // ----------------------------------------------------------
 
   if (
@@ -3575,6 +3528,10 @@ void drawSerialScreen() {
   );
 
 
+  // ----------------------------------------------------------
+  // TITLE
+  // ----------------------------------------------------------
+
   display.setTextColor(
     COLOR_WHITE,
     COLOR_BLACK
@@ -3586,13 +3543,20 @@ void drawSerialScreen() {
 
   display.setCursor(
     16,
-    12
+    15
   );
 
 
   display.print(
     "SERIAL MONITOR"
   );
+
+
+  // ----------------------------------------------------------
+  // LINK STATUS
+  // ----------------------------------------------------------
+
+  drawSerialLinkStatus();
 
 
   // ----------------------------------------------------------
@@ -3608,6 +3572,12 @@ void drawSerialScreen() {
   );
 
 
+  display.setTextColor(
+    COLOR_WHITE,
+    COLOR_BLACK
+  );
+
+
   display.setTextSize(3);
 
 
@@ -3620,8 +3590,14 @@ void drawSerialScreen() {
   display.print("X");
 
 
+  // ----------------------------------------------------------
+  // HISTORY
+  // ----------------------------------------------------------
+
   refreshSerialScreen();
 
+
+  // Force border redraw
 
   previousAlarmBorderScreen =
     SCREEN_LIGHTBAR;
@@ -3631,6 +3607,123 @@ void drawSerialScreen() {
 
 
   updateAlarmBorder();
+}
+
+
+// ============================================================
+// SERIAL LINK STATUS
+// ============================================================
+
+void drawSerialLinkStatus() {
+
+  display.fillRect(
+    300,
+    8,
+    430,
+    38,
+    COLOR_BLACK
+  );
+
+
+  display.setTextSize(2);
+
+
+  // ----------------------------------------------------------
+  // NANO
+  // ----------------------------------------------------------
+
+  display.setTextColor(
+    COLOR_WHITE,
+    COLOR_BLACK
+  );
+
+
+  display.setCursor(
+    310,
+    15
+  );
+
+
+  display.print(
+    "NANO:"
+  );
+
+
+  if (
+    nanoLinkLost
+  ) {
+
+    display.setTextColor(
+      COLOR_RED,
+      COLOR_BLACK
+    );
+
+
+    display.print(
+      "LOST"
+    );
+
+  } else {
+
+    display.setTextColor(
+      COLOR_OBS_GREEN,
+      COLOR_BLACK
+    );
+
+
+    display.print(
+      "OK"
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // MEGA
+  // ----------------------------------------------------------
+
+  display.setTextColor(
+    COLOR_WHITE,
+    COLOR_BLACK
+  );
+
+
+  display.setCursor(
+    500,
+    15
+  );
+
+
+  display.print(
+    "MEGA:"
+  );
+
+
+  if (
+    megaLinkLost
+  ) {
+
+    display.setTextColor(
+      COLOR_RED,
+      COLOR_BLACK
+    );
+
+
+    display.print(
+      "LOST"
+    );
+
+  } else {
+
+    display.setTextColor(
+      COLOR_OBS_GREEN,
+      COLOR_BLACK
+    );
+
+
+    display.print(
+      "OK"
+    );
+  }
 }
 
 
@@ -3796,6 +3889,9 @@ void refreshSerialScreen() {
 
     y += 17;
   }
+
+
+  drawSerialLinkStatus();
 }
 
 
@@ -3808,12 +3904,14 @@ void handleSerialTouch(
   int y
 ) {
 
+  // X RETURNS TO LIGHTBAR CONTROLLER
+
   if (
     x >= 735 &&
     y <= 55
   ) {
 
-    drawGaugeScreen();
+    drawLightbarScreen();
   }
 }
 
@@ -3830,7 +3928,9 @@ void updateAlarmBorder() {
   // ----------------------------------------------------------
   // GAUGE SCREEN
   //
-  // ONLY engine-data conditions can trigger the border.
+  // ONLY:
+  //   simulation
+  //   truck-data timeout
   // ----------------------------------------------------------
 
   if (
@@ -3847,7 +3947,9 @@ void updateAlarmBorder() {
   // ----------------------------------------------------------
   // LIGHTBAR / SERIAL
   //
-  // ONLY Nano/Mega communication conditions can trigger it.
+  // ONLY:
+  //   Nano comm loss
+  //   Mega comm loss
   // ----------------------------------------------------------
 
   else if (
@@ -3863,27 +3965,15 @@ void updateAlarmBorder() {
   }
 
 
-  // ----------------------------------------------------------
-  // SHOULD RED CURRENTLY BE VISIBLE?
-  // ----------------------------------------------------------
-
   bool borderVisible =
     alarm &&
     flashState;
 
 
-  // ----------------------------------------------------------
-  // DID SCREEN CHANGE?
-  // ----------------------------------------------------------
-
   bool screenChanged =
     previousAlarmBorderScreen !=
     currentScreen;
 
-
-  // ----------------------------------------------------------
-  // NO DISPLAY CHANGE REQUIRED
-  // ----------------------------------------------------------
 
   if (
     !screenChanged &&
@@ -3903,19 +3993,11 @@ void updateAlarmBorder() {
     borderVisible;
 
 
-  // ----------------------------------------------------------
-  // BORDER COLOR
-  // ----------------------------------------------------------
-
   uint16_t borderColor =
     borderVisible ?
     COLOR_RED :
     COLOR_BLACK;
 
-
-  // ----------------------------------------------------------
-  // DRAW BORDER
-  // ----------------------------------------------------------
 
   display.drawRect(
     0,
