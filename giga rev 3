@@ -1,0 +1,4248 @@
+/*
+  ============================================================
+  CODE 3 MX7000 - ARDUINO GIGA DISPLAY CONTROLLER
+  ============================================================
+
+  Arduino GIGA R1 WiFi + GIGA Display Shield
+
+  GIGA <-> Nano ESP32
+  ----------------------------------------
+  GIGA D1 TX  -> Nano D12 RX
+  GIGA D0 RX  <- Nano D13 TX
+  GIGA GND    -> Nano GND
+  Baud: 38400
+
+  ============================================================
+  GAUGE SCREEN
+  ============================================================
+
+  Left:
+    IPR
+    0-100 %
+
+  Right:
+    ICP
+    0-4000 PSI
+
+  Theme:
+    Black background
+    OBS Ford-style green
+    Red needles
+
+  Header:
+    7.3 POWER STROKE
+    BLACK BETTY
+
+  Hidden Lightbar Gesture:
+    Put TWO fingers in the central gauge area.
+    Move both generally DOWN approximately 50 pixels.
+
+    No time limit.
+    Fingers do not need to stay perfectly aligned.
+    Diagonal movement is tolerated.
+
+  ============================================================
+  LIGHTBAR SCREEN
+  ============================================================
+
+  Equal-size 5 x 2 grid:
+
+  ROW 1:
+    TRAFFIC BREAKER
+    INNERS
+    INTERMEDIATES
+    OUTERS
+    LEDS
+
+  ROW 2:
+    CLOSE
+    TA LEFT
+    TA OUT
+    TA RIGHT
+    MONITOR
+
+  CLOSE:
+    Returns to Gauge screen.
+
+  MONITOR:
+    Opens Serial Monitor.
+
+  ============================================================
+  SERIAL MONITOR
+  ============================================================
+
+  NO hidden gesture.
+
+  Opened only from MONITOR button.
+
+  X button returns directly to Gauge screen.
+
+  ============================================================
+  GAUGE ALARM
+  ============================================================
+
+  Gauge flashing red border ONLY when:
+
+    1. Simulation mode is active
+       OR
+    2. Real truck data times out.
+
+  Nano/Mega communication failure does NOT cause
+  the Gauge screen border to flash.
+
+  Lightbar and Serial screens DO use Nano/Mega
+  communication status for their red border.
+
+  ============================================================
+*/
+
+#include <Arduino_GigaDisplay_GFX.h>
+#include <Arduino_GigaDisplayTouch.h>
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+
+
+// ============================================================
+// DISPLAY / TOUCH
+// ============================================================
+
+GigaDisplay_GFX display;
+Arduino_GigaDisplayTouch touch;
+
+const int SCREEN_W = 800;
+const int SCREEN_H = 480;
+
+
+// ============================================================
+// COLORS
+// ============================================================
+
+#define COLOR_BLACK       0x0000
+#define COLOR_WHITE       0xFFFF
+#define COLOR_RED         0xF800
+#define COLOR_GREEN       0x07E0
+#define COLOR_BLUE        0x001F
+#define COLOR_GRAY        0x8410
+#define COLOR_DARKGRAY    0x3186
+#define COLOR_LIGHTGRAY   0xC618
+
+/*
+   OBS Ford-style illuminated green.
+*/
+const uint16_t COLOR_OBS_GREEN = 0x87F0;
+
+const uint16_t COLOR_BUTTON_DARK = 0x1082;
+const uint16_t COLOR_PURPLE      = 0x8010;
+const uint16_t COLOR_BORDER      = 0x4208;
+
+
+// ============================================================
+// UART
+// ============================================================
+
+#define NanoSerial Serial1
+
+const unsigned long NANO_BAUD = 38400;
+
+
+// ============================================================
+// COMMANDS
+// ============================================================
+
+enum CommandIndex {
+  CMD_OUTERS = 0,
+  CMD_INTERMEDIATES,
+  CMD_INNERS,
+  CMD_TRAFFICBREAKERS,
+  CMD_LEDS,
+  CMD_TLEFT,
+  CMD_TRIGHT,
+  CMD_TOUT,
+  CMD_LEFTSIGNAL,
+  CMD_RIGHTSIGNAL,
+  NUM_COMMANDS
+};
+
+
+const char *commandNames[NUM_COMMANDS] = {
+  "OUTERS",
+  "INTERMEDIATES",
+  "INNERS",
+  "TRAFFICBREAKERS",
+  "LEDS",
+  "TLEFT",
+  "TRIGHT",
+  "TOUT",
+  "LEFTSIGNAL",
+  "RIGHTSIGNAL"
+};
+
+
+// ============================================================
+// LIGHTBAR STATE
+// ============================================================
+
+struct LightbarState {
+
+  bool physical;
+  bool giga;
+  bool effective;
+  bool megaConfirmed;
+  bool startupHold;
+
+  bool failed;
+
+  char failureReason[32];
+
+  bool nanoAckPending;
+  bool pendingStart;
+
+  byte nanoRetries;
+
+  unsigned long commandSentAt;
+
+  bool waitingForConfirmation;
+};
+
+
+LightbarState lightbar[NUM_COMMANDS];
+
+
+// ============================================================
+// COMMUNICATION
+// ============================================================
+
+const unsigned long GIGA_PING_INTERVAL = 5000;
+const unsigned long NANO_TIMEOUT       = 15000;
+
+const unsigned long COMMAND_ACK_TIMEOUT = 1500;
+
+const byte MAX_NANO_RETRIES = 2;
+
+unsigned long lastPingSent = 0;
+unsigned long lastNanoReceive = 0;
+
+bool nanoLinkLost = true;
+bool megaLinkLost = true;
+
+
+// ============================================================
+// FLASH TIMING
+// ============================================================
+
+const unsigned long FLASH_INTERVAL = 500;
+
+unsigned long lastFlashTime = 0;
+
+bool flashState = true;
+
+
+// ============================================================
+// SCREENS
+// ============================================================
+
+enum ScreenType {
+
+  SCREEN_GAUGES,
+  SCREEN_LIGHTBAR,
+  SCREEN_SERIAL
+
+};
+
+
+ScreenType currentScreen = SCREEN_GAUGES;
+
+
+// ============================================================
+// ENGINE DATA
+// ============================================================
+
+struct EngineData {
+
+  float ipr;
+  float icp;
+
+};
+
+
+EngineData engineData;
+
+
+/*
+   TRUE = simulated IPR / ICP data.
+
+   While simulation is active, the Gauge screen intentionally
+   flashes the red warning border.
+*/
+
+bool simulateEngineData = true;
+
+
+// ============================================================
+// TRUCK DATA WATCHDOG
+// ============================================================
+
+unsigned long lastTruckDataReceived = 0;
+
+const unsigned long TRUCK_DATA_TIMEOUT = 3000;
+
+bool truckDataTimedOut = true;
+
+
+void markTruckDataReceived() {
+
+  lastTruckDataReceived = millis();
+
+  truckDataTimedOut = false;
+}
+
+
+// ============================================================
+// GAUGE STRUCTURE
+// ============================================================
+
+struct Gauge {
+
+  int cx;
+  int cy;
+  int radius;
+
+  float minValue;
+  float maxValue;
+
+  float filteredValue;
+  float displayedValue;
+
+  float lastNeedleValue;
+
+  int lastDigitalValue;
+
+  const char *title;
+  const char *unit;
+
+};
+
+
+// ============================================================
+// GAUGES
+// ============================================================
+
+/*
+   Gauges have been moved slightly downward to provide
+   dedicated space ABOVE the gauge circles for the
+   IPR and ICP labels.
+*/
+
+Gauge iprGauge = {
+
+  220,
+  275,
+  140,
+
+  0.0,
+  100.0,
+
+  0.0,
+  0.0,
+
+  -9999.0,
+
+  -9999,
+
+  "IPR",
+  "%"
+
+};
+
+
+Gauge icpGauge = {
+
+  580,
+  275,
+  140,
+
+  0.0,
+  4000.0,
+
+  0.0,
+  0.0,
+
+  -9999.0,
+
+  -9999,
+
+  "ICP",
+  "PSI"
+
+};
+
+
+// ============================================================
+// GAUGE UPDATE SETTINGS
+// ============================================================
+
+const float GAUGE_SMOOTHING = 0.15;
+
+const unsigned long GAUGE_UPDATE_INTERVAL = 33;
+
+unsigned long lastGaugeUpdate = 0;
+
+const float IPR_NEEDLE_DEADBAND = 0.15;
+const float ICP_NEEDLE_DEADBAND = 5.0;
+
+
+// ============================================================
+// LIGHTBAR BUTTON GRID
+// ============================================================
+
+struct TouchButton {
+
+  int x;
+  int y;
+  int w;
+  int h;
+
+  int command;
+
+  const char *label;
+
+  bool isClose;
+  bool isMonitor;
+
+};
+
+
+/*
+   800 pixel screen.
+
+   5 equal columns.
+
+   Left/right margin = 10
+   Gap = 8
+
+   Available button width:
+   800 - 20 - (4 * 8)
+   = 748
+
+   748 / 5 ~= 149
+
+   Using 148 gives comfortable margins.
+*/
+
+const int BUTTON_W = 148;
+const int BUTTON_H = 150;
+
+const int BUTTON_GAP_X = 8;
+const int BUTTON_GAP_Y = 12;
+
+const int BUTTON_START_X = 14;
+const int BUTTON_START_Y = 82;
+
+
+/*
+   ==========================================================
+   LIGHTBAR LAYOUT
+
+   ROW 1
+   ----------------------------------------------------------
+   TRAFFIC BREAKER
+   INNERS
+   INTERMEDIATES
+   OUTERS
+   LEDS
+
+   ROW 2
+   ----------------------------------------------------------
+   CLOSE
+   TA LEFT
+   TA OUT
+   TA RIGHT
+   MONITOR
+
+   EVERY BUTTON IS EXACTLY THE SAME SIZE.
+   ==========================================================
+*/
+
+
+TouchButton lightbarButtons[] = {
+
+  // ROW 1
+
+  {
+    BUTTON_START_X + 0 * (BUTTON_W + BUTTON_GAP_X),
+    BUTTON_START_Y,
+    BUTTON_W,
+    BUTTON_H,
+    CMD_TRAFFICBREAKERS,
+    "TRAFFIC BREAKER",
+    false,
+    false
+  },
+
+  {
+    BUTTON_START_X + 1 * (BUTTON_W + BUTTON_GAP_X),
+    BUTTON_START_Y,
+    BUTTON_W,
+    BUTTON_H,
+    CMD_INNERS,
+    "INNERS",
+    false,
+    false
+  },
+
+  {
+    BUTTON_START_X + 2 * (BUTTON_W + BUTTON_GAP_X),
+    BUTTON_START_Y,
+    BUTTON_W,
+    BUTTON_H,
+    CMD_INTERMEDIATES,
+    "INTERMEDIATES",
+    false,
+    false
+  },
+
+  {
+    BUTTON_START_X + 3 * (BUTTON_W + BUTTON_GAP_X),
+    BUTTON_START_Y,
+    BUTTON_W,
+    BUTTON_H,
+    CMD_OUTERS,
+    "OUTERS",
+    false,
+    false
+  },
+
+  {
+    BUTTON_START_X + 4 * (BUTTON_W + BUTTON_GAP_X),
+    BUTTON_START_Y,
+    BUTTON_W,
+    BUTTON_H,
+    CMD_LEDS,
+    "LEDS",
+    false,
+    false
+  },
+
+
+  // ROW 2
+
+  {
+    BUTTON_START_X + 0 * (BUTTON_W + BUTTON_GAP_X),
+    BUTTON_START_Y + BUTTON_H + BUTTON_GAP_Y,
+    BUTTON_W,
+    BUTTON_H,
+    -1,
+    "CLOSE",
+    true,
+    false
+  },
+
+  {
+    BUTTON_START_X + 1 * (BUTTON_W + BUTTON_GAP_X),
+    BUTTON_START_Y + BUTTON_H + BUTTON_GAP_Y,
+    BUTTON_W,
+    BUTTON_H,
+    CMD_TLEFT,
+    "TA LEFT",
+    false,
+    false
+  },
+
+  {
+    BUTTON_START_X + 2 * (BUTTON_W + BUTTON_GAP_X),
+    BUTTON_START_Y + BUTTON_H + BUTTON_GAP_Y,
+    BUTTON_W,
+    BUTTON_H,
+    CMD_TOUT,
+    "TA OUT",
+    false,
+    false
+  },
+
+  {
+    BUTTON_START_X + 3 * (BUTTON_W + BUTTON_GAP_X),
+    BUTTON_START_Y + BUTTON_H + BUTTON_GAP_Y,
+    BUTTON_W,
+    BUTTON_H,
+    CMD_TRIGHT,
+    "TA RIGHT",
+    false,
+    false
+  },
+
+  {
+    BUTTON_START_X + 4 * (BUTTON_W + BUTTON_GAP_X),
+    BUTTON_START_Y + BUTTON_H + BUTTON_GAP_Y,
+    BUTTON_W,
+    BUTTON_H,
+    -1,
+    "MONITOR",
+    false,
+    true
+  }
+
+};
+
+
+const int NUM_LIGHTBAR_BUTTONS =
+  sizeof(lightbarButtons) /
+  sizeof(lightbarButtons[0]);
+
+
+// ============================================================
+// SERIAL MONITOR
+// ============================================================
+
+const int SERIAL_LOG_SIZE = 48;
+
+const int SERIAL_MESSAGE_LENGTH = 110;
+
+
+struct SerialLogEntry {
+
+  unsigned long timestamp;
+
+  char direction[8];
+
+  char message[SERIAL_MESSAGE_LENGTH];
+
+};
+
+
+SerialLogEntry serialLog[SERIAL_LOG_SIZE];
+
+int serialLogHead = 0;
+
+int serialLogCount = 0;
+
+bool serialScreenDirty = true;
+
+const unsigned long SERIAL_REDRAW_INTERVAL = 100;
+
+unsigned long lastSerialRedraw = 0;
+
+
+// ============================================================
+// SERIAL CLOSE BUTTON
+// ============================================================
+
+const int SERIAL_CLOSE_X = 735;
+const int SERIAL_CLOSE_Y = 8;
+
+const int SERIAL_CLOSE_W = 55;
+const int SERIAL_CLOSE_H = 50;
+
+
+// ============================================================
+// UART RECEIVE BUFFER
+// ============================================================
+
+char nanoRxBuffer[160];
+
+int nanoRxIndex = 0;
+
+
+// ============================================================
+// TOUCH
+// ============================================================
+
+bool previousTouchActive = false;
+
+unsigned long lastTouchAction = 0;
+
+const unsigned long TOUCH_DEBOUNCE = 250;
+
+
+// ============================================================
+// LIGHTBAR HIDDEN GESTURE
+// ============================================================
+
+/*
+   This is now the ONLY hidden gesture.
+
+   TWO fingers start within the broad central gauge region.
+
+   Then move DOWN.
+
+   No requirement for:
+     - left/right separation
+     - exact finger spacing
+     - equal movement
+     - exact vertical movement
+     - completion within a time window
+
+   Both fingers simply need to start within the gauge region.
+
+   Once tracking begins, average downward movement of
+   approximately 50 pixels opens the Lightbar screen.
+*/
+
+
+const int LIGHTBAR_GESTURE_MIN_DOWN = 50;
+
+
+/*
+   Broad starting region.
+
+   This covers the central area occupied by both gauges.
+*/
+
+const int GESTURE_ZONE_X_MIN = 100;
+const int GESTURE_ZONE_X_MAX = 700;
+
+const int GESTURE_ZONE_Y_MIN = 110;
+const int GESTURE_ZONE_Y_MAX = 380;
+
+
+bool lightbarGestureTracking = false;
+bool lightbarGestureTriggered = false;
+
+int lightbarStartY1 = 0;
+int lightbarStartY2 = 0;
+
+
+// ============================================================
+// FUNCTION PROTOTYPES
+// ============================================================
+
+void drawCurrentScreen();
+
+void drawGaugeScreenStatic();
+
+void updateGaugeScreenDynamic(bool force);
+
+void drawGaugeStatic(
+  Gauge &gauge,
+  int majorStep
+);
+
+void updateGaugeDynamic(
+  Gauge &gauge,
+  float rawValue,
+  float needleDeadband,
+  bool force
+);
+
+void drawNeedle(
+  Gauge &gauge,
+  float value,
+  uint16_t color
+);
+
+void drawDigitalValue(
+  Gauge &gauge,
+  int value
+);
+
+float valueToAngle(
+  float value,
+  float minValue,
+  float maxValue
+);
+
+
+void drawLightbarScreen();
+
+void updateLightbarButtons();
+
+void drawSerialScreen();
+
+void drawAlarmBorder();
+
+
+void processNanoSerial();
+
+void processNanoLine(
+  char *line
+);
+
+
+void sendToNano(
+  const char *message
+);
+
+void sendPing();
+
+void requestSync();
+
+
+void beginGigaCommand(
+  int command
+);
+
+void sendGigaCommand(
+  int command,
+  bool start
+);
+
+void updateCommandRetries();
+
+
+void addSerialLog(
+  const char *direction,
+  const char *message
+);
+
+
+void processTouch();
+
+void mapTouchPoint(
+  const GDTpoint_t &raw,
+  int &x,
+  int &y
+);
+
+
+void changeScreen(
+  ScreenType newScreen
+);
+
+
+int findCommand(
+  const char *name
+);
+
+
+void parseState(
+  char *line
+);
+
+void parseAck(
+  char *line
+);
+
+void parseConfirmed(
+  char *line
+);
+
+void parseFailed(
+  char *line
+);
+
+
+void updateCommunicationWatchdogs();
+
+void updateTruckDataWatchdog();
+
+void updateEngineData();
+
+
+bool pointInRect(
+  int px,
+  int py,
+  int x,
+  int y,
+  int w,
+  int h
+);
+
+
+bool pointInGestureZone(
+  int x,
+  int y
+);
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  NanoSerial.begin(NANO_BAUD);
+
+
+  // DISPLAY
+
+  display.begin();
+
+  display.setRotation(1);
+
+  display.fillScreen(COLOR_BLACK);
+
+
+  // TOUCH
+
+  if (!touch.begin()) {
+
+    Serial.println(
+      "GIGA Display touch initialization FAILED"
+    );
+
+  }
+
+  else {
+
+    Serial.println(
+      "GIGA Display touch initialized"
+    );
+
+  }
+
+
+  // INITIALIZE LIGHTBAR STATE
+
+  for (
+    int i = 0;
+    i < NUM_COMMANDS;
+    i++
+  ) {
+
+    lightbar[i].physical = false;
+    lightbar[i].giga = false;
+    lightbar[i].effective = false;
+    lightbar[i].megaConfirmed = false;
+    lightbar[i].startupHold = false;
+
+    lightbar[i].failed = false;
+
+    lightbar[i].failureReason[0] = '\0';
+
+    lightbar[i].nanoAckPending = false;
+    lightbar[i].pendingStart = false;
+
+    lightbar[i].nanoRetries = 0;
+
+    lightbar[i].commandSentAt = 0;
+
+    lightbar[i].waitingForConfirmation = false;
+
+  }
+
+
+  // ENGINE DATA
+
+  engineData.ipr = 0;
+  engineData.icp = 0;
+
+  iprGauge.filteredValue = 0;
+  iprGauge.displayedValue = 0;
+
+  icpGauge.filteredValue = 0;
+  icpGauge.displayedValue = 0;
+
+
+  // INITIAL SCREEN
+
+  currentScreen = SCREEN_GAUGES;
+
+  drawCurrentScreen();
+
+
+  // COMMUNICATION
+
+  sendPing();
+
+  requestSync();
+
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  processNanoSerial();
+
+  updateCommunicationWatchdogs();
+
+  updateTruckDataWatchdog();
+
+  updateCommandRetries();
+
+
+  // GIGA -> NANO HEARTBEAT
+
+  if (
+    millis() - lastPingSent >=
+    GIGA_PING_INTERVAL
+  ) {
+
+    sendPing();
+
+  }
+
+
+  // FLASH TIMING
+
+  if (
+    millis() - lastFlashTime >=
+    FLASH_INTERVAL
+  ) {
+
+    lastFlashTime = millis();
+
+    flashState = !flashState;
+
+
+    if (
+      currentScreen ==
+      SCREEN_LIGHTBAR
+    ) {
+
+      updateLightbarButtons();
+
+    }
+
+
+    drawAlarmBorder();
+
+  }
+
+
+  // TOUCH
+
+  processTouch();
+
+
+  // ENGINE DATA
+
+  updateEngineData();
+
+
+  // GAUGE UPDATE
+
+  if (
+    currentScreen == SCREEN_GAUGES &&
+
+    millis() -
+      lastGaugeUpdate >=
+      GAUGE_UPDATE_INTERVAL
+  ) {
+
+    lastGaugeUpdate = millis();
+
+    updateGaugeScreenDynamic(false);
+
+  }
+
+
+  // SERIAL MONITOR
+
+  if (
+    currentScreen == SCREEN_SERIAL &&
+
+    serialScreenDirty &&
+
+    millis() -
+      lastSerialRedraw >=
+      SERIAL_REDRAW_INTERVAL
+  ) {
+
+    lastSerialRedraw = millis();
+
+    drawSerialScreen();
+
+    serialScreenDirty = false;
+
+  }
+
+}
+
+
+// ============================================================
+// SCREEN CHANGE
+// ============================================================
+
+void changeScreen(
+  ScreenType newScreen
+) {
+
+  if (
+    currentScreen == newScreen
+  ) {
+
+    return;
+
+  }
+
+
+  currentScreen = newScreen;
+
+
+  /*
+     Require a complete finger release before another
+     Lightbar gesture can begin.
+  */
+
+  lightbarGestureTracking = false;
+  lightbarGestureTriggered = true;
+
+
+  if (
+    newScreen == SCREEN_GAUGES
+  ) {
+
+    iprGauge.lastNeedleValue = -9999;
+    icpGauge.lastNeedleValue = -9999;
+
+    iprGauge.lastDigitalValue = -9999;
+    icpGauge.lastDigitalValue = -9999;
+
+  }
+
+
+  drawCurrentScreen();
+
+}
+
+
+// ============================================================
+// DRAW CURRENT SCREEN
+// ============================================================
+
+void drawCurrentScreen() {
+
+  display.fillScreen(
+    COLOR_BLACK
+  );
+
+
+  if (
+    currentScreen == SCREEN_GAUGES
+  ) {
+
+    drawGaugeScreenStatic();
+
+    updateGaugeScreenDynamic(true);
+
+  }
+
+
+  else if (
+    currentScreen == SCREEN_LIGHTBAR
+  ) {
+
+    drawLightbarScreen();
+
+  }
+
+
+  else if (
+    currentScreen == SCREEN_SERIAL
+  ) {
+
+    drawSerialScreen();
+
+  }
+
+
+  drawAlarmBorder();
+
+}
+
+
+// ============================================================
+// GAUGE SCREEN STATIC
+// ============================================================
+
+void drawGaugeScreenStatic() {
+
+  display.fillScreen(
+    COLOR_BLACK
+  );
+
+
+  // ==========================================================
+  // HEADER
+  // ==========================================================
+
+  display.setTextColor(
+    COLOR_OBS_GREEN
+  );
+
+  display.setTextSize(2);
+
+
+  display.setCursor(
+    20,
+    15
+  );
+
+  display.print(
+    "7.3 POWER STROKE"
+  );
+
+
+  display.setCursor(
+    625,
+    15
+  );
+
+  display.print(
+    "BLACK BETTY"
+  );
+
+
+  // ==========================================================
+  // LARGE GAUGE LABELS
+  // ==========================================================
+
+  display.setTextSize(3);
+
+  display.setTextColor(
+    COLOR_OBS_GREEN
+  );
+
+
+  // ----------------------------------------------------------
+  // IPR
+  // ----------------------------------------------------------
+
+  {
+    const char *label = "IPR";
+
+    int16_t bx;
+    int16_t by;
+
+    uint16_t bw;
+    uint16_t bh;
+
+
+    display.getTextBounds(
+      label,
+      0,
+      0,
+      &bx,
+      &by,
+      &bw,
+      &bh
+    );
+
+
+    display.setCursor(
+      iprGauge.cx - bw / 2,
+      72
+    );
+
+
+    display.print(label);
+  }
+
+
+  // ----------------------------------------------------------
+  // ICP
+  // ----------------------------------------------------------
+
+  {
+    const char *label = "ICP";
+
+    int16_t bx;
+    int16_t by;
+
+    uint16_t bw;
+    uint16_t bh;
+
+
+    display.getTextBounds(
+      label,
+      0,
+      0,
+      &bx,
+      &by,
+      &bw,
+      &bh
+    );
+
+
+    display.setCursor(
+      icpGauge.cx - bw / 2,
+      72
+    );
+
+
+    display.print(label);
+  }
+
+
+  // ==========================================================
+  // GAUGES
+  // ==========================================================
+
+  drawGaugeStatic(
+    iprGauge,
+    20
+  );
+
+  drawGaugeStatic(
+    icpGauge,
+    500
+  );
+
+
+  /*
+     NO navigation hint is intentionally drawn here.
+  */
+
+}
+
+
+// ============================================================
+// DRAW STATIC GAUGE
+// ============================================================
+
+void drawGaugeStatic(
+  Gauge &gauge,
+  int majorStep
+) {
+
+  // OUTER RINGS
+
+  display.drawCircle(
+    gauge.cx,
+    gauge.cy,
+    gauge.radius,
+    COLOR_OBS_GREEN
+  );
+
+
+  display.drawCircle(
+    gauge.cx,
+    gauge.cy,
+    gauge.radius - 1,
+    COLOR_OBS_GREEN
+  );
+
+
+  display.drawCircle(
+    gauge.cx,
+    gauge.cy,
+    gauge.radius - 8,
+    COLOR_OBS_GREEN
+  );
+
+
+  // ==========================================================
+  // TICKS / SCALE NUMBERS
+  // ==========================================================
+
+  int numberOfTicks =
+    (int)(
+      (
+        gauge.maxValue -
+        gauge.minValue
+      ) /
+      majorStep
+    );
+
+
+  for (
+    int i = 0;
+    i <= numberOfTicks;
+    i++
+  ) {
+
+    float value =
+      gauge.minValue +
+      (
+        i *
+        majorStep
+      );
+
+
+    float angle =
+      valueToAngle(
+        value,
+        gauge.minValue,
+        gauge.maxValue
+      );
+
+
+    float radians =
+      angle *
+      DEG_TO_RAD;
+
+
+    int x1 =
+      gauge.cx +
+      cos(radians) *
+      (
+        gauge.radius -
+        18
+      );
+
+
+    int y1 =
+      gauge.cy +
+      sin(radians) *
+      (
+        gauge.radius -
+        18
+      );
+
+
+    int x2 =
+      gauge.cx +
+      cos(radians) *
+      (
+        gauge.radius -
+        5
+      );
+
+
+    int y2 =
+      gauge.cy +
+      sin(radians) *
+      (
+        gauge.radius -
+        5
+      );
+
+
+    display.drawLine(
+      x1,
+      y1,
+      x2,
+      y2,
+      COLOR_OBS_GREEN
+    );
+
+
+    // SCALE NUMBER
+
+    int labelRadius =
+      gauge.radius -
+      38;
+
+
+    int tx =
+      gauge.cx +
+      cos(radians) *
+      labelRadius;
+
+
+    int ty =
+      gauge.cy +
+      sin(radians) *
+      labelRadius;
+
+
+    char numberBuffer[12];
+
+
+    snprintf(
+      numberBuffer,
+      sizeof(numberBuffer),
+      "%d",
+      (int)value
+    );
+
+
+    int16_t xBounds;
+    int16_t yBounds;
+
+    uint16_t textW;
+    uint16_t textH;
+
+
+    display.setTextSize(1);
+
+
+    display.getTextBounds(
+      numberBuffer,
+      0,
+      0,
+      &xBounds,
+      &yBounds,
+      &textW,
+      &textH
+    );
+
+
+    display.setTextColor(
+      COLOR_OBS_GREEN
+    );
+
+
+    display.setCursor(
+      tx - textW / 2,
+      ty - textH / 2
+    );
+
+
+    display.print(
+      numberBuffer
+    );
+
+  }
+
+
+  // ==========================================================
+  // UNIT INSIDE GAUGE
+  // ==========================================================
+
+  display.setTextSize(2);
+
+  display.setTextColor(
+    COLOR_OBS_GREEN
+  );
+
+
+  int16_t xBounds;
+  int16_t yBounds;
+
+  uint16_t textW;
+  uint16_t textH;
+
+
+  display.getTextBounds(
+    gauge.unit,
+    0,
+    0,
+    &xBounds,
+    &yBounds,
+    &textW,
+    &textH
+  );
+
+
+  display.setCursor(
+    gauge.cx - textW / 2,
+    gauge.cy + 72
+  );
+
+
+  display.print(
+    gauge.unit
+  );
+
+
+  // CENTER HUB
+
+  display.fillCircle(
+    gauge.cx,
+    gauge.cy,
+    8,
+    COLOR_OBS_GREEN
+  );
+
+}
+
+
+// ============================================================
+// UPDATE BOTH GAUGES
+// ============================================================
+
+void updateGaugeScreenDynamic(
+  bool force
+) {
+
+  updateGaugeDynamic(
+    iprGauge,
+    engineData.ipr,
+    IPR_NEEDLE_DEADBAND,
+    force
+  );
+
+
+  updateGaugeDynamic(
+    icpGauge,
+    engineData.icp,
+    ICP_NEEDLE_DEADBAND,
+    force
+  );
+
+}
+
+
+// ============================================================
+// UPDATE ONE GAUGE
+// ============================================================
+
+void updateGaugeDynamic(
+  Gauge &gauge,
+  float rawValue,
+  float needleDeadband,
+  bool force
+) {
+
+  // CLAMP
+
+  if (
+    rawValue < gauge.minValue
+  ) {
+
+    rawValue =
+      gauge.minValue;
+
+  }
+
+
+  if (
+    rawValue > gauge.maxValue
+  ) {
+
+    rawValue =
+      gauge.maxValue;
+
+  }
+
+
+  // SMOOTH
+
+  gauge.filteredValue +=
+    (
+      rawValue -
+      gauge.filteredValue
+    ) *
+    GAUGE_SMOOTHING;
+
+
+  bool needleChanged = false;
+
+
+  if (
+    force ||
+
+    gauge.lastNeedleValue < -1000 ||
+
+    fabs(
+      gauge.filteredValue -
+      gauge.displayedValue
+    ) >= needleDeadband
+  ) {
+
+    gauge.displayedValue =
+      gauge.filteredValue;
+
+    needleChanged = true;
+
+  }
+
+
+  if (
+    needleChanged
+  ) {
+
+    // ERASE OLD NEEDLE
+
+    if (
+      gauge.lastNeedleValue > -1000
+    ) {
+
+      drawNeedle(
+        gauge,
+        gauge.lastNeedleValue,
+        COLOR_BLACK
+      );
+
+    }
+
+
+    // CLEAN HUB
+
+    display.fillCircle(
+      gauge.cx,
+      gauge.cy,
+      10,
+      COLOR_BLACK
+    );
+
+
+    // DRAW RED NEEDLE
+
+    drawNeedle(
+      gauge,
+      gauge.displayedValue,
+      COLOR_RED
+    );
+
+
+    // RESTORE GREEN HUB
+
+    display.fillCircle(
+      gauge.cx,
+      gauge.cy,
+      8,
+      COLOR_OBS_GREEN
+    );
+
+
+    gauge.lastNeedleValue =
+      gauge.displayedValue;
+
+  }
+
+
+  // DIGITAL VALUE
+
+  int digitalValue =
+    (int)
+    round(
+      rawValue
+    );
+
+
+  if (
+    force ||
+
+    digitalValue !=
+      gauge.lastDigitalValue
+  ) {
+
+    drawDigitalValue(
+      gauge,
+      digitalValue
+    );
+
+
+    gauge.lastDigitalValue =
+      digitalValue;
+
+  }
+
+}
+
+
+// ============================================================
+// DRAW NEEDLE
+// ============================================================
+
+void drawNeedle(
+  Gauge &gauge,
+  float value,
+  uint16_t color
+) {
+
+  float angle =
+    valueToAngle(
+      value,
+      gauge.minValue,
+      gauge.maxValue
+    );
+
+
+  float radians =
+    angle *
+    DEG_TO_RAD;
+
+
+  int needleLength =
+    gauge.radius -
+    48;
+
+
+  int x =
+    gauge.cx +
+    cos(radians) *
+    needleLength;
+
+
+  int y =
+    gauge.cy +
+    sin(radians) *
+    needleLength;
+
+
+  display.drawLine(
+    gauge.cx,
+    gauge.cy,
+    x,
+    y,
+    color
+  );
+
+
+  display.drawLine(
+    gauge.cx + 1,
+    gauge.cy,
+    x + 1,
+    y,
+    color
+  );
+
+
+  display.drawLine(
+    gauge.cx,
+    gauge.cy + 1,
+    x,
+    y + 1,
+    color
+  );
+
+}
+
+
+// ============================================================
+// DIGITAL VALUE
+// ============================================================
+
+void drawDigitalValue(
+  Gauge &gauge,
+  int value
+) {
+
+  display.fillRect(
+    gauge.cx - 75,
+    gauge.cy + 24,
+    150,
+    40,
+    COLOR_BLACK
+  );
+
+
+  char valueBuffer[16];
+
+
+  snprintf(
+    valueBuffer,
+    sizeof(valueBuffer),
+    "%d",
+    value
+  );
+
+
+  display.setTextSize(3);
+
+  display.setTextColor(
+    COLOR_OBS_GREEN
+  );
+
+
+  int16_t xBounds;
+  int16_t yBounds;
+
+  uint16_t textW;
+  uint16_t textH;
+
+
+  display.getTextBounds(
+    valueBuffer,
+    0,
+    0,
+    &xBounds,
+    &yBounds,
+    &textW,
+    &textH
+  );
+
+
+  display.setCursor(
+    gauge.cx - textW / 2,
+    gauge.cy + 28
+  );
+
+
+  display.print(
+    valueBuffer
+  );
+
+}
+
+
+// ============================================================
+// VALUE -> GAUGE ANGLE
+// ============================================================
+
+float valueToAngle(
+  float value,
+  float minValue,
+  float maxValue
+) {
+
+  float normalized =
+    (
+      value -
+      minValue
+    ) /
+    (
+      maxValue -
+      minValue
+    );
+
+
+  if (
+    normalized < 0
+  ) {
+
+    normalized = 0;
+
+  }
+
+
+  if (
+    normalized > 1
+  ) {
+
+    normalized = 1;
+
+  }
+
+
+  return
+    135.0 +
+    (
+      normalized *
+      270.0
+    );
+
+}
+
+
+// ============================================================
+// LIGHTBAR SCREEN
+// ============================================================
+
+void drawLightbarScreen() {
+
+  display.fillScreen(
+    COLOR_BLACK
+  );
+
+
+  display.setTextColor(
+    COLOR_WHITE
+  );
+
+  display.setTextSize(3);
+
+
+  display.setCursor(
+    20,
+    22
+  );
+
+  display.print(
+    "CODE 3 MX7000"
+  );
+
+
+  display.setTextSize(1);
+
+  display.setTextColor(
+    COLOR_GRAY
+  );
+
+
+  display.setCursor(
+    590,
+    32
+  );
+
+  display.print(
+    "LIGHTBAR CONTROL"
+  );
+
+
+  updateLightbarButtons();
+
+}
+
+
+// ============================================================
+// UPDATE LIGHTBAR BUTTONS
+// ============================================================
+
+void updateLightbarButtons() {
+
+  for (
+    int i = 0;
+    i < NUM_LIGHTBAR_BUTTONS;
+    i++
+  ) {
+
+    TouchButton &button =
+      lightbarButtons[i];
+
+
+    uint16_t fillColor =
+      COLOR_BUTTON_DARK;
+
+
+    uint16_t borderColor =
+      COLOR_BORDER;
+
+
+    uint16_t textColor =
+      COLOR_WHITE;
+
+
+    // CLOSE
+
+    if (
+      button.isClose
+    ) {
+
+      fillColor =
+        COLOR_DARKGRAY;
+
+      borderColor =
+        COLOR_GRAY;
+
+    }
+
+
+    // MONITOR
+
+    else if (
+      button.isMonitor
+    ) {
+
+      fillColor =
+        COLOR_DARKGRAY;
+
+      borderColor =
+        COLOR_GRAY;
+
+    }
+
+
+    // COMMAND BUTTON
+
+    else {
+
+      LightbarState &state =
+        lightbar[
+          button.command
+        ];
+
+
+      // PHYSICAL SOURCE HAS VISUAL PRIORITY
+
+      if (
+        state.physical
+      ) {
+
+        if (
+          state.startupHold
+        ) {
+
+          fillColor =
+            flashState
+              ?
+            COLOR_BLUE
+              :
+            COLOR_BUTTON_DARK;
+
+        }
+
+        else {
+
+          fillColor =
+            COLOR_BLUE;
+
+        }
+
+      }
+
+
+      // FAILED GIGA COMMAND
+
+      else if (
+        state.failed
+      ) {
+
+        fillColor =
+          flashState
+            ?
+          COLOR_PURPLE
+            :
+          COLOR_BUTTON_DARK;
+
+      }
+
+
+      // GIGA ACTIVE + MEGA CONFIRMED
+
+      else if (
+        state.giga &&
+        state.megaConfirmed
+      ) {
+
+        fillColor =
+          COLOR_GREEN;
+
+      }
+
+    }
+
+
+    // BUTTON BODY
+
+    display.fillRoundRect(
+      button.x,
+      button.y,
+      button.w,
+      button.h,
+      12,
+      fillColor
+    );
+
+
+    display.drawRoundRect(
+      button.x,
+      button.y,
+      button.w,
+      button.h,
+      12,
+      borderColor
+    );
+
+
+    display.setTextColor(
+      textColor
+    );
+
+
+    // TRAFFIC BREAKER
+
+    if (
+      strcmp(
+        button.label,
+        "TRAFFIC BREAKER"
+      ) == 0
+    ) {
+
+      display.setTextSize(2);
+
+
+      int16_t bx;
+      int16_t by;
+
+      uint16_t bw;
+      uint16_t bh;
+
+
+      display.getTextBounds(
+        "TRAFFIC",
+        0,
+        0,
+        &bx,
+        &by,
+        &bw,
+        &bh
+      );
+
+
+      display.setCursor(
+        button.x +
+        (
+          button.w -
+          bw
+        ) / 2,
+
+        button.y + 52
+      );
+
+
+      display.print(
+        "TRAFFIC"
+      );
+
+
+      display.getTextBounds(
+        "BREAKER",
+        0,
+        0,
+        &bx,
+        &by,
+        &bw,
+        &bh
+      );
+
+
+      display.setCursor(
+        button.x +
+        (
+          button.w -
+          bw
+        ) / 2,
+
+        button.y + 82
+      );
+
+
+      display.print(
+        "BREAKER"
+      );
+
+    }
+
+
+    // INTERMEDIATES
+
+    else if (
+      strcmp(
+        button.label,
+        "INTERMEDIATES"
+      ) == 0
+    ) {
+
+      display.setTextSize(1);
+
+
+      int16_t bx;
+      int16_t by;
+
+      uint16_t bw;
+      uint16_t bh;
+
+
+      display.getTextBounds(
+        button.label,
+        0,
+        0,
+        &bx,
+        &by,
+        &bw,
+        &bh
+      );
+
+
+      display.setCursor(
+        button.x +
+        (
+          button.w -
+          bw
+        ) / 2,
+
+        button.y +
+        (
+          button.h -
+          bh
+        ) / 2
+      );
+
+
+      display.print(
+        button.label
+      );
+
+    }
+
+
+    // NORMAL LABEL
+
+    else {
+
+      display.setTextSize(2);
+
+
+      int16_t bx;
+      int16_t by;
+
+      uint16_t bw;
+      uint16_t bh;
+
+
+      display.getTextBounds(
+        button.label,
+        0,
+        0,
+        &bx,
+        &by,
+        &bw,
+        &bh
+      );
+
+
+      display.setCursor(
+        button.x +
+        (
+          button.w -
+          bw
+        ) / 2,
+
+        button.y +
+        (
+          button.h -
+          bh
+        ) / 2
+      );
+
+
+      display.print(
+        button.label
+      );
+
+    }
+
+  }
+
+
+  drawAlarmBorder();
+
+}
+
+
+// ============================================================
+// SERIAL MONITOR
+// ============================================================
+
+void drawSerialScreen() {
+
+  display.fillScreen(
+    COLOR_BLACK
+  );
+
+
+  display.setTextSize(2);
+
+  display.setTextColor(
+    COLOR_WHITE
+  );
+
+
+  display.setCursor(
+    15,
+    14
+  );
+
+
+  display.print(
+    "GIGA / NANO SERIAL MONITOR"
+  );
+
+
+  // CLOSE X
+
+  display.fillRoundRect(
+    SERIAL_CLOSE_X,
+    SERIAL_CLOSE_Y,
+    SERIAL_CLOSE_W,
+    SERIAL_CLOSE_H,
+    8,
+    COLOR_DARKGRAY
+  );
+
+
+  display.drawRoundRect(
+    SERIAL_CLOSE_X,
+    SERIAL_CLOSE_Y,
+    SERIAL_CLOSE_W,
+    SERIAL_CLOSE_H,
+    8,
+    COLOR_GRAY
+  );
+
+
+  display.setTextSize(3);
+
+  display.setTextColor(
+    COLOR_WHITE
+  );
+
+
+  display.setCursor(
+    SERIAL_CLOSE_X + 18,
+    SERIAL_CLOSE_Y + 13
+  );
+
+
+  display.print("X");
+
+
+  display.drawFastHLine(
+    10,
+    67,
+    780,
+    COLOR_DARKGRAY
+  );
+
+
+  // LOG
+
+  const int MAX_VISIBLE = 23;
+
+
+  int visible =
+    serialLogCount;
+
+
+  if (
+    visible > MAX_VISIBLE
+  ) {
+
+    visible =
+      MAX_VISIBLE;
+
+  }
+
+
+  int startOffset =
+    serialLogCount -
+    visible;
+
+
+  display.setTextSize(1);
+
+
+  for (
+    int row = 0;
+    row < visible;
+    row++
+  ) {
+
+    int logicalIndex =
+      startOffset +
+      row;
+
+
+    int physicalIndex =
+      (
+        serialLogHead -
+        serialLogCount +
+        logicalIndex +
+        SERIAL_LOG_SIZE
+      )
+      %
+      SERIAL_LOG_SIZE;
+
+
+    SerialLogEntry &entry =
+      serialLog[
+        physicalIndex
+      ];
+
+
+    int y =
+      78 +
+      row * 17;
+
+
+    // TIMESTAMP
+
+    display.setTextColor(
+      COLOR_GRAY
+    );
+
+
+    display.setCursor(
+      12,
+      y
+    );
+
+
+    display.print(
+      entry.timestamp /
+      1000
+    );
+
+
+    display.print("s");
+
+
+    // DIRECTION
+
+    uint16_t directionColor =
+      COLOR_WHITE;
+
+
+    if (
+      strcmp(
+        entry.direction,
+        "G>N"
+      ) == 0
+    ) {
+
+      directionColor =
+        COLOR_GREEN;
+
+    }
+
+
+    else if (
+      strcmp(
+        entry.direction,
+        "N>G"
+      ) == 0
+    ) {
+
+      directionColor =
+        COLOR_BLUE;
+
+    }
+
+
+    else if (
+      strcmp(
+        entry.direction,
+        "ERR"
+      ) == 0
+    ) {
+
+      directionColor =
+        COLOR_RED;
+
+    }
+
+
+    display.setTextColor(
+      directionColor
+    );
+
+
+    display.setCursor(
+      65,
+      y
+    );
+
+
+    display.print(
+      entry.direction
+    );
+
+
+    // MESSAGE
+
+    display.setTextColor(
+      COLOR_WHITE
+    );
+
+
+    display.setCursor(
+      105,
+      y
+    );
+
+
+    display.print(
+      entry.message
+    );
+
+  }
+
+
+  drawAlarmBorder();
+
+}
+
+
+// ============================================================
+// ALARM BORDER
+// ============================================================
+
+void drawAlarmBorder() {
+
+  bool alarm = false;
+
+
+  // GAUGE SCREEN = ENGINE DATA ONLY
+
+  if (
+    currentScreen == SCREEN_GAUGES
+  ) {
+
+    alarm =
+      simulateEngineData ||
+      truckDataTimedOut;
+
+  }
+
+
+  // LIGHTBAR / SERIAL = COMMUNICATION
+
+  else {
+
+    alarm =
+      nanoLinkLost ||
+      megaLinkLost;
+
+  }
+
+
+  uint16_t color =
+    COLOR_BLACK;
+
+
+  if (
+    alarm &&
+    flashState
+  ) {
+
+    color =
+      COLOR_RED;
+
+  }
+
+
+  display.drawRect(
+    0,
+    0,
+    SCREEN_W,
+    SCREEN_H,
+    color
+  );
+
+
+  display.drawRect(
+    1,
+    1,
+    SCREEN_W - 2,
+    SCREEN_H - 2,
+    color
+  );
+
+
+  display.drawRect(
+    2,
+    2,
+    SCREEN_W - 4,
+    SCREEN_H - 4,
+    color
+  );
+
+}
+
+
+// ============================================================
+// SEND TO NANO
+// ============================================================
+
+void sendToNano(
+  const char *message
+) {
+
+  NanoSerial.println(
+    message
+  );
+
+
+  addSerialLog(
+    "G>N",
+    message
+  );
+
+}
+
+
+// ============================================================
+// PING
+// ============================================================
+
+void sendPing() {
+
+  sendToNano(
+    "GIGA_PING"
+  );
+
+
+  lastPingSent =
+    millis();
+
+}
+
+
+// ============================================================
+// SYNC REQUEST
+// ============================================================
+
+void requestSync() {
+
+  sendToNano(
+    "SYNC_REQUEST"
+  );
+
+}
+
+
+// ============================================================
+// BEGIN GIGA COMMAND
+// ============================================================
+
+void beginGigaCommand(
+  int command
+) {
+
+  if (
+    command < 0 ||
+    command >= NUM_COMMANDS
+  ) {
+
+    return;
+
+  }
+
+
+  LightbarState &state =
+    lightbar[command];
+
+
+  if (
+    state.nanoAckPending ||
+    state.waitingForConfirmation
+  ) {
+
+    return;
+
+  }
+
+
+  bool desiredStart =
+    !state.giga;
+
+
+  state.failed = false;
+
+  state.failureReason[0] =
+    '\0';
+
+
+  state.pendingStart =
+    desiredStart;
+
+
+  state.nanoRetries = 0;
+
+
+  state.nanoAckPending =
+    true;
+
+
+  state.waitingForConfirmation =
+    false;
+
+
+  sendGigaCommand(
+    command,
+    desiredStart
+  );
+
+}
+
+
+// ============================================================
+// SEND START / STOP
+// ============================================================
+
+void sendGigaCommand(
+  int command,
+  bool start
+) {
+
+  char buffer[80];
+
+
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "%s %s",
+    start
+      ?
+    "START"
+      :
+    "STOP",
+    commandNames[command]
+  );
+
+
+  sendToNano(
+    buffer
+  );
+
+
+  lightbar[
+    command
+  ].commandSentAt = millis();
+
+}
+
+
+// ============================================================
+// COMMAND RETRIES
+// ============================================================
+
+void updateCommandRetries() {
+
+  for (
+    int i = 0;
+    i < NUM_COMMANDS;
+    i++
+  ) {
+
+    LightbarState &state =
+      lightbar[i];
+
+
+    if (
+      !state.nanoAckPending
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      millis() -
+      state.commandSentAt <
+      COMMAND_ACK_TIMEOUT
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      state.nanoRetries <
+      MAX_NANO_RETRIES
+    ) {
+
+      state.nanoRetries++;
+
+
+      sendGigaCommand(
+        i,
+        state.pendingStart
+      );
+
+
+      char diagnostic[100];
+
+
+      snprintf(
+        diagnostic,
+        sizeof(diagnostic),
+        "RETRY %d %s %s",
+        state.nanoRetries,
+        state.pendingStart
+          ?
+        "START"
+          :
+        "STOP",
+        commandNames[i]
+      );
+
+
+      addSerialLog(
+        "ERR",
+        diagnostic
+      );
+
+    }
+
+
+    else {
+
+      state.nanoAckPending =
+        false;
+
+
+      state.waitingForConfirmation =
+        false;
+
+
+      state.failed =
+        true;
+
+
+      strncpy(
+        state.failureReason,
+        "NANO_NO_ACK",
+        sizeof(
+          state.failureReason
+        ) - 1
+      );
+
+
+      state.failureReason[
+        sizeof(
+          state.failureReason
+        ) - 1
+      ] = '\0';
+
+
+      char diagnostic[100];
+
+
+      snprintf(
+        diagnostic,
+        sizeof(diagnostic),
+        "NANO_NO_ACK %s",
+        commandNames[i]
+      );
+
+
+      addSerialLog(
+        "ERR",
+        diagnostic
+      );
+
+
+      if (
+        currentScreen ==
+        SCREEN_LIGHTBAR
+      ) {
+
+        updateLightbarButtons();
+
+      }
+
+    }
+
+  }
+
+}
+
+
+// ============================================================
+// NANO SERIAL RECEIVE
+// ============================================================
+
+void processNanoSerial() {
+
+  while (
+    NanoSerial.available()
+  ) {
+
+    char c =
+      NanoSerial.read();
+
+
+    if (
+      c == '\r'
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      c == '\n'
+    ) {
+
+      if (
+        nanoRxIndex > 0
+      ) {
+
+        nanoRxBuffer[
+          nanoRxIndex
+        ] = '\0';
+
+
+        processNanoLine(
+          nanoRxBuffer
+        );
+
+
+        nanoRxIndex = 0;
+
+      }
+
+    }
+
+
+    else {
+
+      if (
+        nanoRxIndex <
+        sizeof(
+          nanoRxBuffer
+        ) - 1
+      ) {
+
+        nanoRxBuffer[
+          nanoRxIndex++
+        ] = c;
+
+      }
+
+
+      else {
+
+        nanoRxIndex = 0;
+
+
+        addSerialLog(
+          "ERR",
+          "NANO RX OVERFLOW"
+        );
+
+      }
+
+    }
+
+  }
+
+}
+
+
+// ============================================================
+// PROCESS NANO LINE
+// ============================================================
+
+void processNanoLine(
+  char *line
+) {
+
+  lastNanoReceive =
+    millis();
+
+
+  addSerialLog(
+    "N>G",
+    line
+  );
+
+
+  if (
+    nanoLinkLost
+  ) {
+
+    nanoLinkLost =
+      false;
+
+
+    addSerialLog(
+      "N>G",
+      "NANO LINK RESTORED"
+    );
+
+  }
+
+
+  if (
+    strcmp(
+      line,
+      "GIGA_PONG"
+    ) == 0
+  ) {
+
+    return;
+
+  }
+
+
+  if (
+    strcmp(
+      line,
+      "NANO_BOOT"
+    ) == 0
+  ) {
+
+    for (
+      int i = 0;
+      i < NUM_COMMANDS;
+      i++
+    ) {
+
+      lightbar[i].nanoAckPending =
+        false;
+
+      lightbar[i].waitingForConfirmation =
+        false;
+
+      lightbar[i].failed =
+        false;
+
+    }
+
+
+    requestSync();
+
+    return;
+
+  }
+
+
+  if (
+    strcmp(
+      line,
+      "MEGA_LINK_LOST"
+    ) == 0
+  ) {
+
+    megaLinkLost = true;
+
+    return;
+
+  }
+
+
+  if (
+    strcmp(
+      line,
+      "MEGA_LINK_RESTORED"
+    ) == 0
+  ) {
+
+    megaLinkLost = false;
+
+    return;
+
+  }
+
+
+  if (
+    strcmp(
+      line,
+      "MEGA_REBOOTED"
+    ) == 0
+  ) {
+
+    megaLinkLost = true;
+
+    return;
+
+  }
+
+
+  if (
+    strcmp(
+      line,
+      "MEGA_FAILSAFE"
+    ) == 0
+  ) {
+
+    megaLinkLost = true;
+
+    return;
+
+  }
+
+
+  if (
+    strcmp(
+      line,
+      "MEGA_RECOVERED"
+    ) == 0
+  ) {
+
+    megaLinkLost = false;
+
+    return;
+
+  }
+
+
+  if (
+    strncmp(
+      line,
+      "STATE ",
+      6
+    ) == 0
+  ) {
+
+    parseState(line);
+
+    return;
+
+  }
+
+
+  if (
+    strncmp(
+      line,
+      "ACK ",
+      4
+    ) == 0
+  ) {
+
+    parseAck(line);
+
+    return;
+
+  }
+
+
+  if (
+    strncmp(
+      line,
+      "CONFIRMED ",
+      10
+    ) == 0
+  ) {
+
+    parseConfirmed(line);
+
+    return;
+
+  }
+
+
+  if (
+    strncmp(
+      line,
+      "FAILED ",
+      7
+    ) == 0
+  ) {
+
+    parseFailed(line);
+
+    return;
+
+  }
+
+}
+
+
+// ============================================================
+// PARSE STATE
+// ============================================================
+
+void parseState(
+  char *line
+) {
+
+  char commandName[32];
+
+  int p = 0;
+  int g = 0;
+  int e = 0;
+  int m = 0;
+  int h = 0;
+
+
+  int result =
+    sscanf(
+      line,
+      "STATE %31s P=%d G=%d E=%d M=%d H=%d",
+      commandName,
+      &p,
+      &g,
+      &e,
+      &m,
+      &h
+    );
+
+
+  if (
+    result != 6
+  ) {
+
+    return;
+
+  }
+
+
+  int command =
+    findCommand(
+      commandName
+    );
+
+
+  if (
+    command < 0
+  ) {
+
+    return;
+
+  }
+
+
+  lightbar[
+    command
+  ].physical = p != 0;
+
+
+  lightbar[
+    command
+  ].giga = g != 0;
+
+
+  lightbar[
+    command
+  ].effective = e != 0;
+
+
+  lightbar[
+    command
+  ].megaConfirmed = m != 0;
+
+
+  lightbar[
+    command
+  ].startupHold = h != 0;
+
+
+  if (
+    currentScreen ==
+    SCREEN_LIGHTBAR
+  ) {
+
+    updateLightbarButtons();
+
+  }
+
+}
+
+
+// ============================================================
+// PARSE ACK
+// ============================================================
+
+void parseAck(
+  char *line
+) {
+
+  char action[16];
+  char commandName[32];
+
+
+  if (
+    sscanf(
+      line,
+      "ACK %15s %31s",
+      action,
+      commandName
+    ) != 2
+  ) {
+
+    return;
+
+  }
+
+
+  int command =
+    findCommand(
+      commandName
+    );
+
+
+  if (
+    command < 0
+  ) {
+
+    return;
+
+  }
+
+
+  bool start =
+    strcasecmp(
+      action,
+      "START"
+    ) == 0;
+
+
+  LightbarState &state =
+    lightbar[command];
+
+
+  if (
+    state.nanoAckPending &&
+    state.pendingStart ==
+      start
+  ) {
+
+    state.nanoAckPending =
+      false;
+
+
+    state.waitingForConfirmation =
+      true;
+
+  }
+
+}
+
+
+// ============================================================
+// PARSE CONFIRMED
+// ============================================================
+
+void parseConfirmed(
+  char *line
+) {
+
+  char action[16];
+  char commandName[32];
+
+
+  if (
+    sscanf(
+      line,
+      "CONFIRMED %15s %31s",
+      action,
+      commandName
+    ) != 2
+  ) {
+
+    return;
+
+  }
+
+
+  int command =
+    findCommand(
+      commandName
+    );
+
+
+  if (
+    command < 0
+  ) {
+
+    return;
+
+  }
+
+
+  bool start =
+    strcasecmp(
+      action,
+      "START"
+    ) == 0;
+
+
+  LightbarState &state =
+    lightbar[command];
+
+
+  state.nanoAckPending =
+    false;
+
+
+  state.waitingForConfirmation =
+    false;
+
+
+  state.failed =
+    false;
+
+
+  state.failureReason[0] =
+    '\0';
+
+
+  state.giga =
+    start;
+
+
+  state.megaConfirmed =
+    start;
+
+
+  if (
+    currentScreen ==
+    SCREEN_LIGHTBAR
+  ) {
+
+    updateLightbarButtons();
+
+  }
+
+}
+
+
+// ============================================================
+// PARSE FAILED
+// ============================================================
+
+void parseFailed(
+  char *line
+) {
+
+  char action[16];
+  char commandName[32];
+  char reason[32];
+
+
+  if (
+    sscanf(
+      line,
+      "FAILED %15s %31s %31s",
+      action,
+      commandName,
+      reason
+    ) < 3
+  ) {
+
+    return;
+
+  }
+
+
+  int command =
+    findCommand(
+      commandName
+    );
+
+
+  if (
+    command < 0
+  ) {
+
+    return;
+
+  }
+
+
+  LightbarState &state =
+    lightbar[command];
+
+
+  state.nanoAckPending =
+    false;
+
+
+  state.waitingForConfirmation =
+    false;
+
+
+  state.failed =
+    true;
+
+
+  strncpy(
+    state.failureReason,
+    reason,
+    sizeof(
+      state.failureReason
+    ) - 1
+  );
+
+
+  state.failureReason[
+    sizeof(
+      state.failureReason
+    ) - 1
+  ] = '\0';
+
+
+  if (
+    currentScreen ==
+    SCREEN_LIGHTBAR
+  ) {
+
+    updateLightbarButtons();
+
+  }
+
+}
+
+
+// ============================================================
+// FIND COMMAND
+// ============================================================
+
+int findCommand(
+  const char *name
+) {
+
+  for (
+    int i = 0;
+    i < NUM_COMMANDS;
+    i++
+  ) {
+
+    if (
+      strcasecmp(
+        name,
+        commandNames[i]
+      ) == 0
+    ) {
+
+      return i;
+
+    }
+
+  }
+
+
+  return -1;
+
+}
+
+
+// ============================================================
+// COMMUNICATION WATCHDOG
+// ============================================================
+
+void updateCommunicationWatchdogs() {
+
+  if (
+    lastNanoReceive > 0 &&
+
+    millis() -
+      lastNanoReceive >
+      NANO_TIMEOUT
+  ) {
+
+    if (
+      !nanoLinkLost
+    ) {
+
+      nanoLinkLost =
+        true;
+
+
+      addSerialLog(
+        "ERR",
+        "NANO LINK LOST"
+      );
+
+
+      for (
+        int i = 0;
+        i < NUM_COMMANDS;
+        i++
+      ) {
+
+        if (
+          lightbar[i].nanoAckPending ||
+          lightbar[i].waitingForConfirmation
+        ) {
+
+          lightbar[i].nanoAckPending =
+            false;
+
+
+          lightbar[i].waitingForConfirmation =
+            false;
+
+
+          lightbar[i].failed =
+            true;
+
+
+          strncpy(
+            lightbar[i].failureReason,
+            "NANO_LINK_LOST",
+            sizeof(
+              lightbar[i].failureReason
+            ) - 1
+          );
+
+
+          lightbar[i].failureReason[
+            sizeof(
+              lightbar[i].failureReason
+            ) - 1
+          ] = '\0';
+
+        }
+
+      }
+
+    }
+
+  }
+
+}
+
+
+// ============================================================
+// TRUCK DATA WATCHDOG
+// ============================================================
+
+void updateTruckDataWatchdog() {
+
+  if (
+    simulateEngineData
+  ) {
+
+    truckDataTimedOut =
+      true;
+
+    return;
+
+  }
+
+
+  if (
+    lastTruckDataReceived == 0
+  ) {
+
+    truckDataTimedOut =
+      true;
+
+    return;
+
+  }
+
+
+  if (
+    millis() -
+      lastTruckDataReceived >
+      TRUCK_DATA_TIMEOUT
+  ) {
+
+    truckDataTimedOut =
+      true;
+
+  }
+
+}
+
+
+// ============================================================
+// SERIAL LOG
+// ============================================================
+
+void addSerialLog(
+  const char *direction,
+  const char *message
+) {
+
+  SerialLogEntry &entry =
+    serialLog[
+      serialLogHead
+    ];
+
+
+  entry.timestamp =
+    millis();
+
+
+  strncpy(
+    entry.direction,
+    direction,
+    sizeof(
+      entry.direction
+    ) - 1
+  );
+
+
+  entry.direction[
+    sizeof(
+      entry.direction
+    ) - 1
+  ] = '\0';
+
+
+  strncpy(
+    entry.message,
+    message,
+    sizeof(
+      entry.message
+    ) - 1
+  );
+
+
+  entry.message[
+    sizeof(
+      entry.message
+    ) - 1
+  ] = '\0';
+
+
+  serialLogHead =
+    (
+      serialLogHead +
+      1
+    )
+    %
+    SERIAL_LOG_SIZE;
+
+
+  if (
+    serialLogCount <
+    SERIAL_LOG_SIZE
+  ) {
+
+    serialLogCount++;
+
+  }
+
+
+  serialScreenDirty =
+    true;
+
+}
+
+
+// ============================================================
+// SIMULATED ENGINE DATA
+// ============================================================
+
+void updateEngineData() {
+
+  if (
+    !simulateEngineData
+  ) {
+
+    return;
+
+  }
+
+
+  float t =
+    millis() /
+    1000.0;
+
+
+  engineData.ipr =
+    35.0 +
+    sin(
+      t * 0.7
+    ) *
+    15.0 +
+    sin(
+      t * 2.3
+    ) *
+    2.0;
+
+
+  engineData.icp =
+    1800.0 +
+    sin(
+      t * 0.45
+    ) *
+    850.0 +
+    sin(
+      t * 1.8
+    ) *
+    100.0;
+
+
+  if (
+    engineData.ipr < 0
+  ) {
+
+    engineData.ipr = 0;
+
+  }
+
+
+  if (
+    engineData.ipr > 100
+  ) {
+
+    engineData.ipr = 100;
+
+  }
+
+
+  if (
+    engineData.icp < 0
+  ) {
+
+    engineData.icp = 0;
+
+  }
+
+
+  if (
+    engineData.icp > 4000
+  ) {
+
+    engineData.icp = 4000;
+
+  }
+
+}
+
+
+// ============================================================
+// TOUCH MAPPING
+//
+// IMPORTANT:
+//
+// This remains isolated because the physical Display Shield
+// may require adjustment after testing.
+// ============================================================
+
+void mapTouchPoint(
+  const GDTpoint_t &raw,
+  int &x,
+  int &y
+) {
+
+  x = raw.y;
+
+  y = 479 - raw.x;
+
+}
+
+
+// ============================================================
+// GESTURE START ZONE
+// ============================================================
+
+bool pointInGestureZone(
+  int x,
+  int y
+) {
+
+  return (
+    x >= GESTURE_ZONE_X_MIN &&
+    x <= GESTURE_ZONE_X_MAX &&
+    y >= GESTURE_ZONE_Y_MIN &&
+    y <= GESTURE_ZONE_Y_MAX
+  );
+
+}
+
+
+// ============================================================
+// PROCESS TOUCH
+// ============================================================
+
+void processTouch() {
+
+  GDTpoint_t points[5];
+
+
+  uint8_t contacts =
+    touch.getTouchPoints(
+      points
+    );
+
+
+  bool touchActive =
+    contacts > 0;
+
+
+  // ==========================================================
+  // NO FINGERS
+  //
+  // Fully reset the gesture detector.
+  // ==========================================================
+
+  if (
+    contacts == 0
+  ) {
+
+    lightbarGestureTracking =
+      false;
+
+
+    lightbarGestureTriggered =
+      false;
+
+
+    previousTouchActive =
+      false;
+
+
+    return;
+
+  }
+
+
+  // ==========================================================
+  // HIDDEN LIGHTBAR GESTURE
+  //
+  // ONLY AVAILABLE FROM GAUGE SCREEN.
+  // ==========================================================
+
+  if (
+    currentScreen == SCREEN_GAUGES &&
+    contacts >= 2
+  ) {
+
+    int x1;
+    int y1;
+
+    int x2;
+    int y2;
+
+
+    mapTouchPoint(
+      points[0],
+      x1,
+      y1
+    );
+
+
+    mapTouchPoint(
+      points[1],
+      x2,
+      y2
+    );
+
+
+    // --------------------------------------------------------
+    // START TRACKING
+    //
+    // Both fingers simply need to start somewhere in the
+    // broad gauge region.
+    // --------------------------------------------------------
+
+    if (
+      !lightbarGestureTracking &&
+      !lightbarGestureTriggered
+    ) {
+
+      bool finger1Valid =
+        pointInGestureZone(
+          x1,
+          y1
+        );
+
+
+      bool finger2Valid =
+        pointInGestureZone(
+          x2,
+          y2
+        );
+
+
+      if (
+        finger1Valid &&
+        finger2Valid
+      ) {
+
+        lightbarGestureTracking =
+          true;
+
+
+        lightbarStartY1 =
+          y1;
+
+
+        lightbarStartY2 =
+          y2;
+
+      }
+
+    }
+
+
+    // --------------------------------------------------------
+    // TRACK DOWNWARD MOVEMENT
+    // --------------------------------------------------------
+
+    else if (
+      lightbarGestureTracking &&
+      !lightbarGestureTriggered
+    ) {
+
+      int down1 =
+        y1 -
+        lightbarStartY1;
+
+
+      int down2 =
+        y2 -
+        lightbarStartY2;
+
+
+      float averageDown =
+        (
+          down1 +
+          down2
+        )
+        /
+        2.0;
+
+
+      /*
+         Average downward movement is the main requirement.
+
+         Also require that neither finger has moved strongly
+         upward. One finger may move much less than the other.
+      */
+
+      bool fingerDirectionsOkay =
+        (
+          down1 > -20 &&
+          down2 > -20
+        );
+
+
+      if (
+        averageDown >=
+          LIGHTBAR_GESTURE_MIN_DOWN &&
+
+        fingerDirectionsOkay
+      ) {
+
+        lightbarGestureTriggered =
+          true;
+
+
+        lightbarGestureTracking =
+          false;
+
+
+        changeScreen(
+          SCREEN_LIGHTBAR
+        );
+
+
+        previousTouchActive =
+          true;
+
+
+        return;
+
+      }
+
+    }
+
+
+    /*
+       While two fingers are down on the Gauge screen,
+       don't process them as normal button touches.
+    */
+
+    previousTouchActive =
+      true;
+
+    return;
+
+  }
+
+
+  // ==========================================================
+  // SINGLE-FINGER BUTTON TOUCH
+  // ==========================================================
+
+  if (
+    contacts == 1 &&
+
+    !previousTouchActive &&
+
+    millis() -
+      lastTouchAction >
+      TOUCH_DEBOUNCE
+  ) {
+
+    int x;
+    int y;
+
+
+    mapTouchPoint(
+      points[0],
+      x,
+      y
+    );
+
+
+    // ========================================================
+    // LIGHTBAR BUTTONS
+    // ========================================================
+
+    if (
+      currentScreen ==
+      SCREEN_LIGHTBAR
+    ) {
+
+      for (
+        int i = 0;
+        i <
+          NUM_LIGHTBAR_BUTTONS;
+        i++
+      ) {
+
+        TouchButton &button =
+          lightbarButtons[i];
+
+
+        if (
+          pointInRect(
+            x,
+            y,
+            button.x,
+            button.y,
+            button.w,
+            button.h
+          )
+        ) {
+
+          lastTouchAction =
+            millis();
+
+
+          // CLOSE
+
+          if (
+            button.isClose
+          ) {
+
+            changeScreen(
+              SCREEN_GAUGES
+            );
+
+          }
+
+
+          // MONITOR
+
+          else if (
+            button.isMonitor
+          ) {
+
+            serialScreenDirty =
+              true;
+
+
+            changeScreen(
+              SCREEN_SERIAL
+            );
+
+          }
+
+
+          // NORMAL COMMAND
+
+          else {
+
+            beginGigaCommand(
+              button.command
+            );
+
+          }
+
+
+          break;
+
+        }
+
+      }
+
+    }
+
+
+    // ========================================================
+    // SERIAL CLOSE X
+    // ========================================================
+
+    else if (
+      currentScreen ==
+      SCREEN_SERIAL
+    ) {
+
+      if (
+        pointInRect(
+          x,
+          y,
+          SERIAL_CLOSE_X,
+          SERIAL_CLOSE_Y,
+          SERIAL_CLOSE_W,
+          SERIAL_CLOSE_H
+        )
+      ) {
+
+        lastTouchAction =
+          millis();
+
+
+        changeScreen(
+          SCREEN_GAUGES
+        );
+
+      }
+
+    }
+
+  }
+
+
+  previousTouchActive =
+    touchActive;
+
+}
+
+
+// ============================================================
+// POINT IN RECTANGLE
+// ============================================================
+
+bool pointInRect(
+  int px,
+  int py,
+  int x,
+  int y,
+  int w,
+  int h
+) {
+
+  return (
+    px >= x &&
+    px < x + w &&
+    py >= y &&
+    py < y + h
+  );
+
+}
