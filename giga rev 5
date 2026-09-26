@@ -4,48 +4,71 @@
   Arduino GIGA R1 WiFi + GIGA Display Shield
   ============================================================
 
+  GIGA <-> NANO ESP32 UART
+  -----------------------
+  GIGA D1 TX  -> Nano D12 RX
+  GIGA D0 RX  <- Nano D13 TX
+  GIGA GND    -> Nano GND
+  Baud: 38400
+
+  ============================================================
   SCREENS
-  -------
-  1. GAUGES
-     - IPR 0-100 %
-     - ICP 0-4000 PSI
-     - Hidden two-finger DOWN swipe opens Lightbar screen
-
-  2. LIGHTBAR
-     Row 1:
-       TRAFFIC BREAKER | INNERS | INTERMEDIATES | OUTERS | LEDS
-
-     Row 2:
-       CLOSE | TA LEFT | TA OUT | TA RIGHT | MONITOR
-
-  3. SERIAL MONITOR
-     - Opened ONLY from MONITOR button
-     - X button returns directly to Gauge screen
-
-  ============================================================
-  TOUCH DISCOVERY
   ============================================================
 
-  GIGA Display raw touch coordinates were experimentally found
-  to behave as follows in landscape orientation:
+  GAUGE SCREEN
+    - IPR 0-100 %
+    - ICP 0-4000 PSI
+    - Hidden two-finger downward swipe opens Lightbar
+    - Red border ONLY for:
+        * simulation mode
+        * truck-data timeout
 
-      Physical DOWN = RAW X DECREASES
+  LIGHTBAR SCREEN
+    Row 1:
+      TRAFFIC BREAKER | INNERS | INTERMEDIATES | OUTERS | LEDS
 
-  Touch controller also briefly drops contacts approximately
-  every 4-5 ms.
+    Row 2:
+      CLOSE | TA LEFT | TA OUT | TA RIGHT | MONITOR
 
-  Therefore the hidden gesture detector:
+    - Red border ONLY for Nano/Mega communication problems
 
-      - Uses RAW touch coordinates
-      - Requires two contacts to begin
-      - Uses average RAW X
-      - Allows 0/1-contact dropouts for 150 ms
-      - Does NOT reset during brief dropouts
-      - Triggers after 70 RAW units downward
-      - Requires a real release before another gesture
+  SERIAL MONITOR
+    - Opened only through MONITOR
+    - X returns directly to Gauge screen
+    - Red border ONLY for Nano/Mega communication problems
+
+  ============================================================
+  SECRET GESTURE
+  ============================================================
+
+  Touch testing established:
+
+      Physical DOWN = RAW X DECREASING
+
+  Touch controller also produces brief 0/1-contact dropouts.
+
+  Gesture therefore:
+    - requires 2 contacts to start
+    - uses average raw X
+    - ignores brief dropouts
+    - 150 ms release grace
+    - 70 raw-unit downward threshold
+    - no time limit
+
+  ============================================================
+  LIGHTBAR ENTRY SAFETY
+  ============================================================
+
+  After gesture opens Lightbar:
+
+    1. Buttons locked for 1 second
+    2. Original fingers must actually be released
+    3. Release must last 150 ms
+    4. Only then are buttons enabled
 
   ============================================================
 */
+
 
 #include <Arduino_GigaDisplay_GFX.h>
 #include <Arduino_GigaDisplayTouch.h>
@@ -72,19 +95,43 @@ const int SCREEN_W = 800;
 const int SCREEN_H = 480;
 
 
-// RGB565 COLORS
+// ============================================================
+// COLORS
+// ============================================================
 
-const uint16_t COLOR_BLACK      = 0x0000;
-const uint16_t COLOR_WHITE      = 0xFFFF;
-const uint16_t COLOR_RED        = 0xF800;
-const uint16_t COLOR_BLUE       = 0x001F;
-const uint16_t COLOR_GREEN      = 0x07E0;
-const uint16_t COLOR_PURPLE     = 0x8010;
-const uint16_t COLOR_GRAY       = 0x8410;
-const uint16_t COLOR_DARK_GRAY  = 0x2104;
+const uint16_t COLOR_BLACK = 0x0000;
+const uint16_t COLOR_WHITE = 0xFFFF;
+const uint16_t COLOR_RED   = 0xF800;
 
-// OBS Ford-style green
-const uint16_t COLOR_OBS_GREEN  = 0x87F0;
+
+// ------------------------------------------------------------
+// PERIOD-STYLE CONTROL COLORS
+// ------------------------------------------------------------
+
+// Dark/muted physical-switch blue
+const uint16_t COLOR_BLUE = 0x0210;
+
+// Dark/muted failure purple
+const uint16_t COLOR_PURPLE = 0x4010;
+
+// Text / monitor gray
+const uint16_t COLOR_GRAY = 0x8410;
+
+// General dark gray
+const uint16_t COLOR_DARK_GRAY = 0x2104;
+
+// CLOSE / MONITOR idle button
+const uint16_t COLOR_BUTTON_IDLE = 0x1082;
+
+
+// ------------------------------------------------------------
+// OBS FORD INSTRUMENT GREEN
+// ------------------------------------------------------------
+
+const uint16_t COLOR_OBS_GREEN = 0x87F0;
+
+// Confirmed GIGA commands use exactly the same green
+const uint16_t COLOR_GREEN = COLOR_OBS_GREEN;
 
 
 // ============================================================
@@ -93,10 +140,6 @@ const uint16_t COLOR_OBS_GREEN  = 0x87F0;
 
 const unsigned long USB_BAUD  = 115200;
 const unsigned long NANO_BAUD = 38400;
-
-// GIGA Serial1:
-// D0 = RX
-// D1 = TX
 
 #define NanoSerial Serial1
 
@@ -185,10 +228,10 @@ const byte MAX_NANO_RETRIES = 2;
 // ============================================================
 
 const unsigned long HEARTBEAT_INTERVAL = 5000;
-const unsigned long NANO_TIMEOUT       = 15000;
+const unsigned long NANO_TIMEOUT = 15000;
 
 unsigned long lastHeartbeatSent = 0;
-unsigned long lastNanoResponse  = 0;
+unsigned long lastNanoResponse = 0;
 
 bool nanoLinkLost = true;
 bool megaLinkLost = true;
@@ -242,7 +285,7 @@ bool simulateEngineData = true;
 
 
 // ------------------------------------------------------------
-// REAL DATA WATCHDOG
+// REAL TRUCK DATA WATCHDOG
 // ------------------------------------------------------------
 
 const unsigned long TRUCK_DATA_TIMEOUT = 3000;
@@ -260,31 +303,16 @@ const unsigned long GAUGE_UPDATE_INTERVAL = 33;
 
 unsigned long lastGaugeUpdate = 0;
 
-
-// Smoothing
-
 const float GAUGE_SMOOTHING = 0.15;
-
-
-// Deadbands
 
 const float IPR_DEADBAND = 0.15;
 const float ICP_DEADBAND = 5.0;
 
-
-// Smoothed values
-
 float displayedIPR = 0;
 float displayedICP = 0;
 
-
-// Previous needle values
-
 float previousNeedleIPR = -999;
 float previousNeedleICP = -999;
-
-
-// Previous digital values
 
 int previousDigitalIPR = -999;
 int previousDigitalICP = -999;
@@ -319,68 +347,59 @@ const int BUTTON_GAP_Y = 12;
 
 
 // ============================================================
-// TOUCH BUTTON DEBOUNCE
+// NORMAL BUTTON TOUCH
 // ============================================================
 
 bool buttonTouchActive = false;
 
 
 // ============================================================
-// NEW DROPOUT-TOLERANT SECRET GESTURE
+// SECRET GESTURE
 // ============================================================
-
-/*
-   Raw touch testing established:
-
-      physical downward movement
-              =
-      raw X DECREASING
-
-   We intentionally use RAW coordinates here.
-*/
-
 
 const unsigned long TOUCH_RELEASE_GRACE = 150;
 
-
-// Amount RAW X must decrease
-
 const int SECRET_SWIPE_DISTANCE = 70;
-
-
-// Broad raw-X starting area around the gauges.
-//
-// Earlier testing:
-// approximately raw X 238 around gauge area.
-//
-// Keep this intentionally generous.
 
 const int SECRET_START_RAW_X_MIN = 100;
 const int SECRET_START_RAW_X_MAX = 380;
 
-
-// Require the two fingers to be reasonably separated horizontally.
-//
-// Since RAW Y represents screen horizontal position,
-// this prevents two contacts almost on top of each other from
-// accidentally starting the gesture.
-
 const int SECRET_MIN_FINGER_SEPARATION = 100;
 
-
-// Gesture state
-
 bool secretGestureTracking = false;
-
 bool secretGestureTriggered = false;
-
 bool secretGestureLocked = false;
 
 float secretStartRawX = 0;
-
 float secretLowestRawX = 0;
 
 unsigned long secretLastValidTouch = 0;
+
+
+// ============================================================
+// LIGHTBAR ENTRY SAFETY LOCK
+// ============================================================
+
+// Minimum time after Lightbar opens before buttons can operate.
+
+const unsigned long LIGHTBAR_TOUCH_LOCKOUT = 1000;
+
+
+// Time that ALL touch must remain absent before the original
+// gesture fingers are considered truly released.
+
+const unsigned long LIGHTBAR_RELEASE_TIME = 150;
+
+
+unsigned long lightbarScreenOpenedAt = 0;
+
+
+// false while waiting for original swipe fingers to be removed
+bool lightbarEntryTouchReleased = true;
+
+
+// Tracks when zero contacts first appeared
+unsigned long lightbarNoTouchSince = 0;
 
 
 // ============================================================
@@ -442,6 +461,7 @@ void updateEngineData();
 void markTruckDataReceived();
 
 void drawLightbarScreen();
+
 void drawLightbarButton(
   int column,
   int row,
@@ -460,12 +480,19 @@ void addSerialMessage(
 );
 
 void handleTouch();
+
 void handleSecretGesture(
   uint8_t contacts,
   GDTpoint_t *points
 );
 
 void resetSecretGesture();
+
+void updateLightbarEntryRelease(
+  uint8_t contacts
+);
+
+bool lightbarTouchEnabled();
 
 void handleLightbarTouch(
   int x,
@@ -494,7 +521,6 @@ void handleNanoSerial();
 void processNanoLine(char *line);
 
 void sendHeartbeat();
-
 void requestSync();
 
 void updateAlarmBorder();
@@ -512,22 +538,13 @@ int commandIndexFromName(
 
 void setup() {
 
-  Serial.begin(
-    USB_BAUD
-  );
+  Serial.begin(USB_BAUD);
 
-
-  NanoSerial.begin(
-    NANO_BAUD
-  );
-
+  NanoSerial.begin(NANO_BAUD);
 
   display.begin();
 
-  display.setRotation(
-    1
-  );
-
+  display.setRotation(1);
 
   touch.begin();
 
@@ -580,7 +597,7 @@ void setup() {
 
 
   // ----------------------------------------------------------
-  // DRAW INITIAL SCREEN
+  // INITIAL SCREEN
   // ----------------------------------------------------------
 
   drawGaugeScreen();
@@ -590,13 +607,9 @@ void setup() {
   // INITIAL COMMUNICATION
   // ----------------------------------------------------------
 
-  NanoSerial.println(
-    "GIGA_PING"
-  );
+  NanoSerial.println("GIGA_PING");
 
-  lastHeartbeatSent =
-    millis();
-
+  lastHeartbeatSent = millis();
 
   addSerialMessage(
     "G>N",
@@ -611,12 +624,11 @@ void setup() {
 
 void loop() {
 
-  unsigned long now =
-    millis();
+  unsigned long now = millis();
 
 
   // ----------------------------------------------------------
-  // NANO COMMUNICATION
+  // COMMUNICATION
   // ----------------------------------------------------------
 
   handleNanoSerial();
@@ -641,12 +653,10 @@ void loop() {
 
 
   // ----------------------------------------------------------
-  // REAL TRUCK DATA WATCHDOG
+  // TRUCK DATA WATCHDOG
   // ----------------------------------------------------------
 
-  if (
-    !simulateEngineData
-  ) {
+  if (!simulateEngineData) {
 
     if (
       now - lastTruckDataReceived >
@@ -656,16 +666,14 @@ void loop() {
       truckDataTimedOut = true;
     }
 
-  }
-
-  else {
+  } else {
 
     truckDataTimedOut = false;
   }
 
 
   // ----------------------------------------------------------
-  // NANO LINK WATCHDOG
+  // NANO WATCHDOG
   // ----------------------------------------------------------
 
   if (
@@ -679,7 +687,7 @@ void loop() {
 
 
   // ----------------------------------------------------------
-  // FLASH STATE
+  // FLASHING
   // ----------------------------------------------------------
 
   if (
@@ -723,7 +731,7 @@ void loop() {
 
 
   // ----------------------------------------------------------
-  // SERIAL MONITOR UPDATE
+  // SERIAL MONITOR
   // ----------------------------------------------------------
 
   if (
@@ -746,9 +754,7 @@ void loop() {
 
 void updateEngineData() {
 
-  if (
-    simulateEngineData
-  ) {
+  if (simulateEngineData) {
 
     float t =
       millis() /
@@ -767,52 +773,32 @@ void updateEngineData() {
       sin(t * 1.8) * 100.0;
 
 
-    if (
-      engineData.ipr < 0
-    ) {
-
+    if (engineData.ipr < 0)
       engineData.ipr = 0;
-    }
 
-
-    if (
-      engineData.ipr > 100
-    ) {
-
+    if (engineData.ipr > 100)
       engineData.ipr = 100;
-    }
 
-
-    if (
-      engineData.icp < 0
-    ) {
-
+    if (engineData.icp < 0)
       engineData.icp = 0;
-    }
 
-
-    if (
-      engineData.icp > 4000
-    ) {
-
+    if (engineData.icp > 4000)
       engineData.icp = 4000;
-    }
   }
 
 
   /*
-     FUTURE REAL TRUCK DATA:
+     FUTURE REAL TRUCK DATA
 
-     When valid diagnostic data arrives:
+     When a valid diagnostic update arrives:
 
-        engineData.ipr = ...
-        engineData.icp = ...
+       engineData.ipr = ...
+       engineData.icp = ...
 
-        markTruckDataReceived();
+       markTruckDataReceived();
 
-     Keep the variable name "truckData" rather than "CAN data"
-     because the 1996 Power Stroke diagnostic interface is not
-     being assumed to be modern CAN.
+     The 1996 truck diagnostic interface is not assumed
+     to be modern CAN.
   */
 }
 
@@ -842,6 +828,18 @@ void drawGaugeScreen() {
 
 
   resetSecretGesture();
+
+
+  lightbarEntryTouchReleased =
+    true;
+
+
+  lightbarNoTouchSince =
+    0;
+
+
+  buttonTouchActive =
+    true;
 
 
   display.fillScreen(
@@ -888,9 +886,7 @@ void drawGaugeStatic() {
   );
 
 
-  display.setTextSize(
-    2
-  );
+  display.setTextSize(2);
 
 
   display.setCursor(
@@ -903,10 +899,9 @@ void drawGaugeStatic() {
   );
 
 
-  // Right header
-
   const char *truckName =
     "BLACK BETTY";
+
 
   int truckNameWidth =
     strlen(truckName) *
@@ -920,6 +915,7 @@ void drawGaugeStatic() {
     18
   );
 
+
   display.print(
     truckName
   );
@@ -929,9 +925,7 @@ void drawGaugeStatic() {
   // GAUGE LABELS
   // ----------------------------------------------------------
 
-  display.setTextSize(
-    4
-  );
+  display.setTextSize(4);
 
 
   display.setCursor(
@@ -939,9 +933,7 @@ void drawGaugeStatic() {
     70
   );
 
-  display.print(
-    "IPR"
-  );
+  display.print("IPR");
 
 
   display.setCursor(
@@ -949,9 +941,7 @@ void drawGaugeStatic() {
     70
   );
 
-  display.print(
-    "ICP"
-  );
+  display.print("ICP");
 
 
   // ----------------------------------------------------------
@@ -1016,9 +1006,7 @@ void drawGaugeStatic() {
   // UNITS
   // ----------------------------------------------------------
 
-  display.setTextSize(
-    2
-  );
+  display.setTextSize(2);
 
 
   display.setCursor(
@@ -1026,9 +1014,7 @@ void drawGaugeStatic() {
     GAUGE_CENTER_Y + 76
   );
 
-  display.print(
-    "%"
-  );
+  display.print("%");
 
 
   display.setCursor(
@@ -1036,9 +1022,7 @@ void drawGaugeStatic() {
     GAUGE_CENTER_Y + 76
   );
 
-  display.print(
-    "PSI"
-  );
+  display.print("PSI");
 }
 
 
@@ -1118,6 +1102,7 @@ void drawGaugeTicks(
 
     char text[12];
 
+
     snprintf(
       text,
       sizeof(text),
@@ -1152,9 +1137,8 @@ void drawGaugeTicks(
       COLOR_BLACK
     );
 
-    display.setTextSize(
-      1
-    );
+
+    display.setTextSize(1);
 
 
     display.setCursor(
@@ -1162,9 +1146,8 @@ void drawGaugeTicks(
       ty - 4
     );
 
-    display.print(
-      text
-    );
+
+    display.print(text);
   }
 }
 
@@ -1174,10 +1157,6 @@ void drawGaugeTicks(
 // ============================================================
 
 void updateGaugeDisplay() {
-
-  // ----------------------------------------------------------
-  // SMOOTH
-  // ----------------------------------------------------------
 
   displayedIPR +=
     (
@@ -1204,12 +1183,12 @@ void updateGaugeDisplay() {
     fabs(
       displayedIPR -
       previousNeedleIPR
-    ) >=
-    IPR_DEADBAND
+    ) >= IPR_DEADBAND
   ) {
 
     if (
-      previousNeedleIPR > -100
+      previousNeedleIPR >
+      -100
     ) {
 
       drawGaugeNeedle(
@@ -1247,12 +1226,12 @@ void updateGaugeDisplay() {
     fabs(
       displayedICP -
       previousNeedleICP
-    ) >=
-    ICP_DEADBAND
+    ) >= ICP_DEADBAND
   ) {
 
     if (
-      previousNeedleICP > -100
+      previousNeedleICP >
+      -100
     ) {
 
       drawGaugeNeedle(
@@ -1306,6 +1285,7 @@ void updateGaugeDisplay() {
       digitalIPR
     );
 
+
     previousDigitalIPR =
       digitalIPR;
   }
@@ -1319,6 +1299,7 @@ void updateGaugeDisplay() {
     drawDigitalICP(
       digitalICP
     );
+
 
     previousDigitalICP =
       digitalICP;
@@ -1339,20 +1320,11 @@ void drawGaugeNeedle(
   uint16_t color
 ) {
 
-  if (
-    value < minimum
-  ) {
-
+  if (value < minimum)
     value = minimum;
-  }
 
-
-  if (
-    value > maximum
-  ) {
-
+  if (value > maximum)
     value = maximum;
-  }
 
 
   float ratio =
@@ -1427,6 +1399,7 @@ void drawDigitalIPR(
 
   char text[16];
 
+
   snprintf(
     text,
     sizeof(text),
@@ -1441,9 +1414,7 @@ void drawDigitalIPR(
   );
 
 
-  display.setTextSize(
-    3
-  );
+  display.setTextSize(3);
 
 
   int width =
@@ -1458,9 +1429,7 @@ void drawDigitalIPR(
   );
 
 
-  display.print(
-    text
-  );
+  display.print(text);
 }
 
 
@@ -1483,6 +1452,7 @@ void drawDigitalICP(
 
   char text[16];
 
+
   snprintf(
     text,
     sizeof(text),
@@ -1497,9 +1467,7 @@ void drawDigitalICP(
   );
 
 
-  display.setTextSize(
-    3
-  );
+  display.setTextSize(3);
 
 
   int width =
@@ -1514,9 +1482,7 @@ void drawDigitalICP(
   );
 
 
-  display.print(
-    text
-  );
+  display.print(text);
 }
 
 
@@ -1533,7 +1499,7 @@ void handleTouch() {
 
 
   // ----------------------------------------------------------
-  // SECRET GAUGE GESTURE
+  // GAUGE SCREEN
   // ----------------------------------------------------------
 
   if (
@@ -1551,7 +1517,28 @@ void handleTouch() {
 
 
   // ----------------------------------------------------------
-  // NORMAL BUTTON TOUCH
+  // LIGHTBAR ENTRY RELEASE MONITOR
+  // ----------------------------------------------------------
+
+  if (
+    currentScreen ==
+    SCREEN_LIGHTBAR &&
+    !lightbarEntryTouchReleased
+  ) {
+
+    updateLightbarEntryRelease(
+      contacts
+    );
+
+    // Never process a Lightbar button while we're still
+    // waiting for the gesture fingers to be removed.
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // NO TOUCH
   // ----------------------------------------------------------
 
   if (
@@ -1565,7 +1552,9 @@ void handleTouch() {
   }
 
 
-  // Only process one button activation per physical touch
+  // ----------------------------------------------------------
+  // ONE ACTIVATION PER TOUCH
+  // ----------------------------------------------------------
 
   if (
     buttonTouchActive
@@ -1590,10 +1579,22 @@ void handleTouch() {
   );
 
 
+  // ----------------------------------------------------------
+  // LIGHTBAR
+  // ----------------------------------------------------------
+
   if (
     currentScreen ==
     SCREEN_LIGHTBAR
   ) {
+
+    if (
+      !lightbarTouchEnabled()
+    ) {
+
+      return;
+    }
+
 
     handleLightbarTouch(
       x,
@@ -1601,6 +1602,10 @@ void handleTouch() {
     );
   }
 
+
+  // ----------------------------------------------------------
+  // SERIAL MONITOR
+  // ----------------------------------------------------------
 
   else if (
     currentScreen ==
@@ -1616,7 +1621,7 @@ void handleTouch() {
 
 
 // ============================================================
-// NEW SECRET TWO-FINGER GESTURE
+// SECRET TWO-FINGER GESTURE
 // ============================================================
 
 void handleSecretGesture(
@@ -1656,7 +1661,7 @@ void handleSecretGesture(
 
 
     // --------------------------------------------------------
-    // LOCKED UNTIL REAL RELEASE
+    // LOCKED UNTIL RELEASE
     // --------------------------------------------------------
 
     if (
@@ -1674,8 +1679,6 @@ void handleSecretGesture(
     if (
       !secretGestureTracking
     ) {
-
-      // Must begin broadly around gauge area
 
       if (
         averageRawX >=
@@ -1723,12 +1726,14 @@ void handleSecretGesture(
     }
 
 
-    // Physical downward = RAW X decreasing
-
     float downwardTravel =
       secretStartRawX -
       secretLowestRawX;
 
+
+    // --------------------------------------------------------
+    // TRIGGER
+    // --------------------------------------------------------
 
     if (
       !secretGestureTriggered &&
@@ -1738,6 +1743,7 @@ void handleSecretGesture(
 
       secretGestureTriggered =
         true;
+
 
       secretGestureLocked =
         true;
@@ -1757,17 +1763,10 @@ void handleSecretGesture(
   // ZERO OR ONE CONTACT
   // ----------------------------------------------------------
   //
-  // DO NOT reset immediately.
+  // Do NOT immediately reset.
   //
-  // Testing showed the touch controller can momentarily report:
-  //
-  //      2 -> 0 -> 2
-  //
-  // or:
-  //
-  //      2 -> 1 -> 2
-  //
-  // within only a few milliseconds.
+  // Actual testing showed temporary 2 -> 0 -> 2 and
+  // 2 -> 1 -> 2 reports only a few milliseconds apart.
   // ----------------------------------------------------------
 
   if (
@@ -1814,7 +1813,120 @@ void resetSecretGesture() {
 
 
 // ============================================================
-// TOUCH MAPPING FOR BUTTONS
+// LIGHTBAR ENTRY RELEASE DETECTOR
+// ============================================================
+
+void updateLightbarEntryRelease(
+  uint8_t contacts
+) {
+
+  unsigned long now =
+    millis();
+
+
+  // ----------------------------------------------------------
+  // ANY CONTACT PRESENT
+  // ----------------------------------------------------------
+  //
+  // Fingers are still physically on the screen, or the touch
+  // controller is still reporting at least one contact.
+  //
+  // Reset the no-touch timer.
+  // ----------------------------------------------------------
+
+  if (
+    contacts > 0
+  ) {
+
+    lightbarNoTouchSince =
+      0;
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // FIRST ZERO-CONTACT SAMPLE
+  // ----------------------------------------------------------
+
+  if (
+    lightbarNoTouchSince == 0
+  ) {
+
+    lightbarNoTouchSince =
+      now;
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // TRUE RELEASE
+  // ----------------------------------------------------------
+  //
+  // Zero contacts must remain continuously present for
+  // LIGHTBAR_RELEASE_TIME.
+  //
+  // A 4-5 ms touch-controller dropout therefore does NOT count.
+  // ----------------------------------------------------------
+
+  if (
+    now -
+    lightbarNoTouchSince >=
+    LIGHTBAR_RELEASE_TIME
+  ) {
+
+    lightbarEntryTouchReleased =
+      true;
+
+
+    lightbarNoTouchSince =
+      0;
+
+
+    // Require a completely new touch before any button
+    // activation.
+
+    buttonTouchActive =
+      false;
+  }
+}
+
+
+// ============================================================
+// CHECK LIGHTBAR TOUCH ENABLED
+// ============================================================
+
+bool lightbarTouchEnabled() {
+
+  // Original gesture fingers must be gone.
+
+  if (
+    !lightbarEntryTouchReleased
+  ) {
+
+    return false;
+  }
+
+
+  // One-second entry lockout must also have expired.
+
+  if (
+    millis() -
+    lightbarScreenOpenedAt <
+    LIGHTBAR_TOUCH_LOCKOUT
+  ) {
+
+    return false;
+  }
+
+
+  return true;
+}
+
+
+// ============================================================
+// TOUCH MAPPING FOR NORMAL BUTTONS
 // ============================================================
 
 void mapTouchPoint(
@@ -1826,7 +1938,9 @@ void mapTouchPoint(
   /*
      Existing landscape mapping.
 
-     Secret gesture intentionally does NOT use this.
+     IMPORTANT:
+     The secret gesture does NOT use this mapping.
+     It uses experimentally verified raw coordinates.
   */
 
   x =
@@ -1848,9 +1962,31 @@ void drawLightbarScreen() {
     SCREEN_LIGHTBAR;
 
 
+  // ----------------------------------------------------------
+  // START ENTRY SAFETY LOCK
+  // ----------------------------------------------------------
+
+  lightbarScreenOpenedAt =
+    millis();
+
+
+  lightbarEntryTouchReleased =
+    false;
+
+
+  lightbarNoTouchSince =
+    0;
+
+
+  // Prevent the gesture touch from becoming a button touch.
+
   buttonTouchActive =
     true;
 
+
+  // ----------------------------------------------------------
+  // DRAW SCREEN
+  // ----------------------------------------------------------
 
   display.fillScreen(
     COLOR_BLACK
@@ -1858,14 +1994,12 @@ void drawLightbarScreen() {
 
 
   display.setTextColor(
-    COLOR_WHITE,
+    COLOR_OBS_GREEN,
     COLOR_BLACK
   );
 
 
-  display.setTextSize(
-    3
-  );
+  display.setTextSize(3);
 
 
   display.setCursor(
@@ -1891,7 +2025,9 @@ void drawLightbarScreen() {
 
 void refreshLightbarButtons() {
 
-  // Row 1
+  // ----------------------------------------------------------
+  // ROW 1
+  // ----------------------------------------------------------
 
   drawLightbarButton(
     0,
@@ -1943,13 +2079,15 @@ void refreshLightbarButtons() {
   );
 
 
-  // Row 2
+  // ----------------------------------------------------------
+  // ROW 2
+  // ----------------------------------------------------------
 
   drawLightbarButton(
     0,
     1,
     "CLOSE",
-    COLOR_DARK_GRAY
+    COLOR_BUTTON_IDLE
   );
 
 
@@ -1987,7 +2125,7 @@ void refreshLightbarButtons() {
     4,
     1,
     "MONITOR",
-    COLOR_DARK_GRAY
+    COLOR_BUTTON_IDLE
   );
 }
 
@@ -2047,7 +2185,9 @@ void drawLightbarButton(
   );
 
 
-  // Handle two-line label
+  // ----------------------------------------------------------
+  // TWO-LINE TRAFFIC BREAKER LABEL
+  // ----------------------------------------------------------
 
   if (
     strcmp(
@@ -2056,9 +2196,7 @@ void drawLightbarButton(
     ) == 0
   ) {
 
-    display.setTextSize(
-      2
-    );
+    display.setTextSize(2);
 
 
     display.setCursor(
@@ -2080,16 +2218,16 @@ void drawLightbarButton(
       "BREAKER"
     );
 
+
     return;
   }
 
 
-  int textSize = 2;
+  // ----------------------------------------------------------
+  // NORMAL LABEL
+  // ----------------------------------------------------------
 
-
-  display.setTextSize(
-    textSize
-  );
+  display.setTextSize(2);
 
 
   int textWidth =
@@ -2138,12 +2276,17 @@ uint16_t getButtonColor(
 
 
   // ----------------------------------------------------------
-  // PHYSICAL SOURCE HAS VISUAL PRIORITY
+  // PHYSICAL SOURCE
+  // ----------------------------------------------------------
+  //
+  // Physical control always has visual priority.
   // ----------------------------------------------------------
 
   if (
     s.physical
   ) {
+
+    // Startup hold = flashing muted blue
 
     if (
       s.startupHold
@@ -2156,9 +2299,12 @@ uint16_t getButtonColor(
         return COLOR_BLUE;
       }
 
+
       return COLOR_BLACK;
     }
 
+
+    // Normal physical control = muted blue
 
     return COLOR_BLUE;
   }
@@ -2180,12 +2326,16 @@ uint16_t getButtonColor(
       return COLOR_PURPLE;
     }
 
+
     return COLOR_BLACK;
   }
 
 
   // ----------------------------------------------------------
-  // GIGA REQUEST CONFIRMED
+  // CONFIRMED GIGA REQUEST
+  // ----------------------------------------------------------
+  //
+  // Uses exactly the same OBS green as the gauges.
   // ----------------------------------------------------------
 
   if (
@@ -2193,9 +2343,13 @@ uint16_t getButtonColor(
     s.megaConfirmed
   ) {
 
-    return COLOR_GREEN;
+    return COLOR_OBS_GREEN;
   }
 
+
+  // ----------------------------------------------------------
+  // INACTIVE
+  // ----------------------------------------------------------
 
   return COLOR_BLACK;
 }
@@ -2210,9 +2364,25 @@ void handleLightbarTouch(
   int y
 ) {
 
+  // ----------------------------------------------------------
+  // SAFETY CHECK
+  // ----------------------------------------------------------
+
+  if (
+    !lightbarTouchEnabled()
+  ) {
+
+    return;
+  }
+
+
   int column = -1;
   int row = -1;
 
+
+  // ----------------------------------------------------------
+  // COLUMN
+  // ----------------------------------------------------------
 
   for (
     int c = 0;
@@ -2241,6 +2411,10 @@ void handleLightbarTouch(
     }
   }
 
+
+  // ----------------------------------------------------------
+  // ROW
+  // ----------------------------------------------------------
 
   for (
     int r = 0;
@@ -2279,9 +2453,9 @@ void handleLightbarTouch(
   }
 
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // ROW 1
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (
     row == 0
@@ -2350,15 +2524,17 @@ void handleLightbarTouch(
   }
 
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // ROW 2
-  // ----------------------------------------------------------
+  // ==========================================================
 
   switch (
     column
   ) {
 
+    // --------------------------------------------------------
     // CLOSE
+    // --------------------------------------------------------
 
     case 0:
 
@@ -2367,43 +2543,57 @@ void handleLightbarTouch(
       break;
 
 
+    // --------------------------------------------------------
     // TA LEFT
+    // --------------------------------------------------------
 
     case 1:
 
       sendGigaCommand(
         CMD_TLEFT,
-        !lightbar[CMD_TLEFT].giga
+        !lightbar[
+          CMD_TLEFT
+        ].giga
       );
 
       break;
 
 
+    // --------------------------------------------------------
     // TA OUT
+    // --------------------------------------------------------
 
     case 2:
 
       sendGigaCommand(
         CMD_TOUT,
-        !lightbar[CMD_TOUT].giga
+        !lightbar[
+          CMD_TOUT
+        ].giga
       );
 
       break;
 
 
+    // --------------------------------------------------------
     // TA RIGHT
+    // --------------------------------------------------------
 
     case 3:
 
       sendGigaCommand(
         CMD_TRIGHT,
-        !lightbar[CMD_TRIGHT].giga
+        !lightbar[
+          CMD_TRIGHT
+        ].giga
       );
 
       break;
 
 
+    // --------------------------------------------------------
     // MONITOR
+    // --------------------------------------------------------
 
     case 4:
 
@@ -2464,7 +2654,7 @@ void sendGigaCommand(
     '\0';
 
 
-  // Locally reflect requested GIGA source
+  // Reflect requested GIGA source locally
 
   s.giga =
     start;
@@ -2477,7 +2667,9 @@ void sendGigaCommand(
     message,
     sizeof(message),
     "%s %s",
-    start ? "START" : "STOP",
+    start ?
+      "START" :
+      "STOP",
     commandNames[command]
   );
 
@@ -2561,8 +2753,8 @@ void retryPendingCommands() {
         sizeof(message),
         "%s %s",
         s.pendingStart ?
-        "START" :
-        "STOP",
+          "START" :
+          "STOP",
         commandNames[i]
       );
 
@@ -2577,9 +2769,7 @@ void retryPendingCommands() {
         message
       );
 
-    }
-
-    else {
+    } else {
 
       s.nanoAckPending =
         false;
@@ -2731,9 +2921,7 @@ void handleNanoSerial() {
           0;
       }
 
-    }
-
-    else {
+    } else {
 
       if (
         nanoRxIndex <
@@ -2745,9 +2933,8 @@ void handleNanoSerial() {
         nanoRxBuffer[
           nanoRxIndex++
         ] = c;
-      }
 
-      else {
+      } else {
 
         nanoRxIndex =
           0;
@@ -2776,7 +2963,7 @@ void processNanoLine(
 
 
   // ----------------------------------------------------------
-  // PONG
+  // GIGA PONG
   // ----------------------------------------------------------
 
   if (
@@ -2829,7 +3016,7 @@ void processNanoLine(
 
 
   // ----------------------------------------------------------
-  // MEGA LINK
+  // MEGA LINK LOST
   // ----------------------------------------------------------
 
   if (
@@ -2848,6 +3035,10 @@ void processNanoLine(
     return;
   }
 
+
+  // ----------------------------------------------------------
+  // MEGA LINK RESTORED
+  // ----------------------------------------------------------
 
   if (
     strcmp(
@@ -2901,7 +3092,9 @@ void processNanoLine(
         index >= 0
       ) {
 
-        lightbar[index].nanoAckPending =
+        lightbar[
+          index
+        ].nanoAckPending =
           false;
       }
     }
@@ -2953,23 +3146,33 @@ void processNanoLine(
           ) == 0;
 
 
-        lightbar[index].megaConfirmed =
+        lightbar[
+          index
+        ].megaConfirmed =
           start;
 
 
-        lightbar[index].waitingForConfirmation =
+        lightbar[
+          index
+        ].waitingForConfirmation =
           false;
 
 
-        lightbar[index].nanoAckPending =
+        lightbar[
+          index
+        ].nanoAckPending =
           false;
 
 
-        lightbar[index].failed =
+        lightbar[
+          index
+        ].failed =
           false;
 
 
-        lightbar[index].failureReason[0] =
+        lightbar[
+          index
+        ].failureReason[0] =
           '\0';
 
 
@@ -3033,15 +3236,21 @@ void processNanoLine(
         index >= 0
       ) {
 
-        lightbar[index].nanoAckPending =
+        lightbar[
+          index
+        ].nanoAckPending =
           false;
 
 
-        lightbar[index].waitingForConfirmation =
+        lightbar[
+          index
+        ].waitingForConfirmation =
           false;
 
 
-        lightbar[index].failed =
+        lightbar[
+          index
+        ].failed =
           true;
 
 
@@ -3050,17 +3259,25 @@ void processNanoLine(
         ) {
 
           strncpy(
-            lightbar[index].failureReason,
+            lightbar[
+              index
+            ].failureReason,
             reason,
             sizeof(
-              lightbar[index].failureReason
+              lightbar[
+                index
+              ].failureReason
             ) - 1
           );
 
 
-          lightbar[index].failureReason[
+          lightbar[
+            index
+          ].failureReason[
             sizeof(
-              lightbar[index].failureReason
+              lightbar[
+                index
+              ].failureReason
             ) - 1
           ] = '\0';
         }
@@ -3125,23 +3342,33 @@ void processNanoLine(
         index >= 0
       ) {
 
-        lightbar[index].physical =
+        lightbar[
+          index
+        ].physical =
           p != 0;
 
 
-        lightbar[index].giga =
+        lightbar[
+          index
+        ].giga =
           g != 0;
 
 
-        lightbar[index].effective =
+        lightbar[
+          index
+        ].effective =
           e != 0;
 
 
-        lightbar[index].megaConfirmed =
+        lightbar[
+          index
+        ].megaConfirmed =
           m != 0;
 
 
-        lightbar[index].startupHold =
+        lightbar[
+          index
+        ].startupHold =
           h != 0;
 
 
@@ -3187,7 +3414,7 @@ void processNanoLine(
 
 
   // ----------------------------------------------------------
-  // DIAG / HOLD
+  // DIAGNOSTIC / HOLD
   // ----------------------------------------------------------
 
   if (
@@ -3209,7 +3436,7 @@ void processNanoLine(
 
 
 // ============================================================
-// COMMAND NAME LOOKUP
+// COMMAND LOOKUP
 // ============================================================
 
 int commandIndexFromName(
@@ -3239,7 +3466,7 @@ int commandIndexFromName(
 
 
 // ============================================================
-// SERIAL MONITOR HISTORY
+// SERIAL HISTORY
 // ============================================================
 
 void addSerialMessage(
@@ -3283,19 +3510,11 @@ void addSerialMessage(
   }
 
 
-  // Also show on USB Serial
+  Serial.print(prefix);
 
-  Serial.print(
-    prefix
-  );
+  Serial.print(" ");
 
-  Serial.print(
-    " "
-  );
-
-  Serial.println(
-    message
-  );
+  Serial.println(message);
 }
 
 
@@ -3324,9 +3543,7 @@ void drawSerialScreen() {
   );
 
 
-  display.setTextSize(
-    2
-  );
+  display.setTextSize(2);
 
 
   display.setCursor(
@@ -3340,7 +3557,9 @@ void drawSerialScreen() {
   );
 
 
-  // Close X
+  // ----------------------------------------------------------
+  // CLOSE X
+  // ----------------------------------------------------------
 
   display.drawRect(
     748,
@@ -3351,9 +3570,7 @@ void drawSerialScreen() {
   );
 
 
-  display.setTextSize(
-    3
-  );
+  display.setTextSize(3);
 
 
   display.setCursor(
@@ -3362,9 +3579,7 @@ void drawSerialScreen() {
   );
 
 
-  display.print(
-    "X"
-  );
+  display.print("X");
 
 
   refreshSerialScreen();
@@ -3378,8 +3593,6 @@ void drawSerialScreen() {
 // ============================================================
 
 void refreshSerialScreen() {
-
-  // Clear message area only
 
   display.fillRect(
     8,
@@ -3416,13 +3629,10 @@ void refreshSerialScreen() {
   }
 
 
-  int y =
-    56;
+  int y = 56;
 
 
-  display.setTextSize(
-    1
-  );
+  display.setTextSize(1);
 
 
   for (
@@ -3440,7 +3650,9 @@ void refreshSerialScreen() {
 
 
     unsigned long seconds =
-      serialHistoryTime[index] /
+      serialHistoryTime[
+        index
+      ] /
       1000;
 
 
@@ -3493,7 +3705,7 @@ void refreshSerialScreen() {
     ) {
 
       directionColor =
-        COLOR_GREEN;
+        COLOR_OBS_GREEN;
     }
 
 
@@ -3540,8 +3752,7 @@ void refreshSerialScreen() {
     );
 
 
-    y +=
-      17;
+    y += 17;
   }
 }
 
@@ -3571,44 +3782,62 @@ void handleSerialTouch(
 
 void updateAlarmBorder() {
 
-  bool alarm;
+  bool alarm =
+    false;
 
 
-  // ----------------------------------------------------------
-  // GAUGE SCREEN
-  // ----------------------------------------------------------
-  //
-  // Gauge screen alarm has NOTHING to do with lightbar comms.
-  //
-  // It flashes only when:
-  //
-  // 1. Engine data is simulated
-  //
-  // OR
-  //
-  // 2. Real truck data has timed out
-  // ----------------------------------------------------------
-
-  if (
-    currentScreen ==
-    SCREEN_GAUGES
+  switch (
+    currentScreen
   ) {
 
-    alarm =
-      simulateEngineData ||
-      truckDataTimedOut;
-  }
+    // ========================================================
+    // GAUGE SCREEN
+    //
+    // ENGINE / TRUCK DATA ONLY
+    //
+    // Nano/Mega lightbar communication status has NO effect
+    // on the Gauge screen border.
+    // ========================================================
+
+    case SCREEN_GAUGES:
+
+      alarm =
+        simulateEngineData ||
+        truckDataTimedOut;
+
+      break;
 
 
-  // ----------------------------------------------------------
-  // LIGHTBAR / SERIAL
-  // ----------------------------------------------------------
+    // ========================================================
+    // LIGHTBAR SCREEN
+    //
+    // LIGHTBAR COMMUNICATION ONLY
+    //
+    // Simulation/truck-data problems have NO effect here.
+    // ========================================================
 
-  else {
+    case SCREEN_LIGHTBAR:
 
-    alarm =
-      nanoLinkLost ||
-      megaLinkLost;
+      alarm =
+        nanoLinkLost ||
+        megaLinkLost;
+
+      break;
+
+
+    // ========================================================
+    // SERIAL MONITOR
+    //
+    // LIGHTBAR COMMUNICATION ONLY
+    // ========================================================
+
+    case SCREEN_SERIAL:
+
+      alarm =
+        nanoLinkLost ||
+        megaLinkLost;
+
+      break;
   }
 
 
@@ -3625,8 +3854,6 @@ void updateAlarmBorder() {
       COLOR_RED;
   }
 
-
-  // Multiple lines for visible border
 
   display.drawRect(
     0,
