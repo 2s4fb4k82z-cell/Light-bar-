@@ -11,6 +11,7 @@
   GIGA GND    -> Nano GND
   Baud: 38400
 
+
   ============================================================
   LIGHTBAR BUTTON COLORS
   ============================================================
@@ -22,19 +23,46 @@
     Physical switch active
 
   FLASHING BLUE
-    Physical switch active but in startup hold
+    Physical switch active but in 120-second startup hold
+
+  RED
+    Physical switch is ON but GIGA override is inhibiting it
 
   FLASHING PURPLE
-    GIGA command is waiting for final confirmation
+    GIGA START/STOP command is waiting for confirmation
 
   SOLID PURPLE
-    GIGA command failed to reach confirmation after 30 seconds
+    GIGA START/STOP command failed to confirm after 30 seconds
 
   GREEN
     GIGA START command confirmed by Mega
 
+
   ============================================================
-  COMMAND RETRY BEHAVIOR
+  PHYSICAL OVERRIDE
+  ============================================================
+
+  BLUE BUTTON:
+    Hold approximately 2 seconds
+    -> OVERRIDE <COMMAND> ON
+
+  FLASHING BLUE BUTTON:
+    Hold approximately 2 seconds
+    -> OVERRIDE <COMMAND> ON
+    -> prevents output from starting when startup hold expires
+
+  RED BUTTON:
+    Hold approximately 2 seconds
+    -> OVERRIDE <COMMAND> OFF
+    -> physical switch regains control
+
+  PHYSICAL SWITCH TURNED OFF:
+    Nano should automatically clear the override.
+    GIGA then receives P=0 O=0 and button becomes DARK.
+
+
+  ============================================================
+  NORMAL GIGA COMMAND RETRIES
   ============================================================
 
   0 sec   Send command
@@ -53,14 +81,35 @@
   30 sec  Give up
           Solid purple
 
-  A CONFIRMED response at any point immediately ends retries.
+  CONFIRMED at any point immediately ends retrying.
 
+
+  ============================================================
+  COMMUNICATION STATUS
+  ============================================================
+
+  NANO OK:
+    Any complete received Nano message within timeout.
+
+  NANO LOST:
+    No complete Nano message within timeout.
+
+  MEGA OK:
+    Recent verified forwarded Mega PONG / link restored
+    AND Nano itself is still reachable.
+
+  MEGA LOST:
+    No recent Mega verification OR Nano is LOST.
+
+  Link status is calculated directly from timestamps.
+  There are no persistent nanoLinkLost / megaLinkLost flags.
   ============================================================
 */
 
 
 #include <Arduino_GigaDisplay_GFX.h>
 #include <Arduino_GigaDisplayTouch.h>
+
 #include <math.h>
 #include <string.h>
 #include <strings.h>
@@ -87,11 +136,11 @@ const uint16_t COLOR_BLACK = 0x0000;
 const uint16_t COLOR_WHITE = 0xFFFF;
 const uint16_t COLOR_RED   = 0xF800;
 
-// Muted 1990s-style physical indicator blue.
-// More visually distinct from purple than previous blue.
+// Muted period-correct blue.
+// Deliberately separated farther from purple.
 const uint16_t COLOR_BLUE = 0x22B8;
 
-// Dark muted command-state purple.
+// Dark muted purple.
 const uint16_t COLOR_PURPLE = 0x4010;
 
 const uint16_t COLOR_GRAY      = 0x8410;
@@ -99,14 +148,13 @@ const uint16_t COLOR_DARK_GRAY = 0x2104;
 
 const uint16_t COLOR_BUTTON_IDLE = 0x1082;
 
-// OBS Ford-style green.
+// OBS-style green.
 const uint16_t COLOR_OBS_GREEN = 0x87F0;
-
-const uint16_t COLOR_GREEN = COLOR_OBS_GREEN;
+const uint16_t COLOR_GREEN     = COLOR_OBS_GREEN;
 
 
 // ============================================================
-// SERIAL COMMUNICATION
+// SERIAL
 // ============================================================
 
 const unsigned long USB_BAUD  = 115200;
@@ -167,25 +215,23 @@ struct LightbarState {
   bool megaConfirmed;
   bool startupHold;
 
-  // Solid-purple terminal failure state.
+  // Physical-switch override reported by Nano.
+  bool overrideActive;
+
+  // Normal GIGA START/STOP failure.
   bool failed;
 
   char failureReason[32];
 
-  // Tracks whether latest attempt has received Nano ACK.
   bool nanoAckPending;
 
-  // true = START transaction
-  // false = STOP transaction
+  // true = START
+  // false = STOP
   bool pendingStart;
 
-  // Time latest transmission was made.
   unsigned long commandSentAt;
-
-  // Time complete GIGA transaction began.
   unsigned long commandStartedAt;
 
-  // Remains true until CONFIRMED or 30-second timeout.
   bool waitingForConfirmation;
 };
 
@@ -194,14 +240,18 @@ LightbarState lightbar[NUM_COMMANDS];
 
 
 // ============================================================
-// COMMAND RETRY / CONFIRMATION
+// NORMAL GIGA COMMAND RETRY
 // ============================================================
 
-// Resend while waiting for CONFIRMED every 5 seconds.
 const unsigned long COMMAND_RETRY_INTERVAL = 5000;
+const unsigned long COMMAND_TOTAL_TIMEOUT  = 30000;
 
-// Give entire transaction 30 seconds.
-const unsigned long COMMAND_TOTAL_TIMEOUT = 30000;
+
+// ============================================================
+// PHYSICAL OVERRIDE
+// ============================================================
+
+const unsigned long OVERRIDE_HOLD_TIME = 2000;
 
 
 // ============================================================
@@ -210,18 +260,14 @@ const unsigned long COMMAND_TOTAL_TIMEOUT = 30000;
 
 const unsigned long HEARTBEAT_INTERVAL = 5000;
 
-// Extended to prevent short communication gaps from
-// producing nuisance LOST indications.
-const unsigned long NANO_TIMEOUT = 30000;
-const unsigned long MEGA_TIMEOUT = 30000;
+// Three missed 5-second heartbeat opportunities before LOST.
+const unsigned long NANO_TIMEOUT = 15000;
+const unsigned long MEGA_TIMEOUT = 15000;
 
 unsigned long lastHeartbeatSent = 0;
 
 unsigned long lastNanoResponse = 0;
 unsigned long lastMegaResponse = 0;
-
-bool nanoLinkLost = true;
-bool megaLinkLost = true;
 
 
 // ============================================================
@@ -240,16 +286,7 @@ ScreenMode currentScreen = SCREEN_GAUGES;
 
 
 // ============================================================
-// ALARM BORDER STATE
-// ============================================================
-
-bool previousAlarmBorderVisible = false;
-
-ScreenMode previousAlarmBorderScreen = SCREEN_GAUGES;
-
-
-// ============================================================
-// FLASHING
+// FLASH STATE
 // ============================================================
 
 const unsigned long FLASH_INTERVAL = 500;
@@ -257,6 +294,15 @@ const unsigned long FLASH_INTERVAL = 500;
 unsigned long lastFlashTime = 0;
 
 bool flashState = false;
+
+
+// ============================================================
+// ALARM BORDER CACHE
+// ============================================================
+
+bool previousAlarmBorderVisible = false;
+
+ScreenMode previousAlarmBorderScreen = SCREEN_GAUGES;
 
 
 // ============================================================
@@ -274,7 +320,7 @@ EngineData engineData;
 
 
 // ============================================================
-// ENGINE DATA SIMULATION
+// ENGINE SIMULATION
 // ============================================================
 
 bool simulateEngineData = true;
@@ -343,7 +389,23 @@ const int BUTTON_GAP_Y = 12;
 
 
 // ============================================================
-// NORMAL BUTTON TOUCH
+// LIGHTBAR PRESS / HOLD TRACKING
+// ============================================================
+
+bool lightbarPressActive = false;
+
+int lightbarPressedColumn = -1;
+int lightbarPressedRow    = -1;
+
+int lightbarPressedCommand = -1;
+
+unsigned long lightbarPressStartedAt = 0;
+
+bool lightbarLongPressHandled = false;
+
+
+// ============================================================
+// GENERAL TOUCH
 // ============================================================
 
 bool buttonTouchActive = false;
@@ -362,11 +424,11 @@ const int SECRET_START_RAW_X_MAX = 380;
 
 const int SECRET_MIN_FINGER_SEPARATION = 100;
 
-bool secretGestureTracking = false;
+bool secretGestureTracking  = false;
 bool secretGestureTriggered = false;
-bool secretGestureLocked = false;
+bool secretGestureLocked    = false;
 
-float secretStartRawX = 0;
+float secretStartRawX  = 0;
 float secretLowestRawX = 0;
 
 unsigned long secretLastValidTouch = 0;
@@ -377,7 +439,7 @@ unsigned long secretLastValidTouch = 0;
 // ============================================================
 
 const unsigned long LIGHTBAR_TOUCH_LOCKOUT = 1000;
-const unsigned long LIGHTBAR_RELEASE_TIME = 150;
+const unsigned long LIGHTBAR_RELEASE_TIME  = 150;
 
 unsigned long lightbarScreenOpenedAt = 0;
 
@@ -396,7 +458,7 @@ char serialHistory[SERIAL_HISTORY_SIZE][96];
 
 unsigned long serialHistoryTime[SERIAL_HISTORY_SIZE];
 
-int serialHistoryHead = 0;
+int serialHistoryHead  = 0;
 int serialHistoryCount = 0;
 
 unsigned long lastSerialScreenDraw = 0;
@@ -405,7 +467,7 @@ const unsigned long SERIAL_SCREEN_INTERVAL = 100;
 
 
 // ============================================================
-// NANO SERIAL RECEIVE BUFFER
+// NANO RECEIVE BUFFER
 // ============================================================
 
 char nanoRxBuffer[160];
@@ -445,6 +507,7 @@ void updateEngineData();
 void markTruckDataReceived();
 
 void drawLightbarScreen();
+void refreshLightbarButtons();
 
 void drawLightbarButton(
   int column,
@@ -453,7 +516,7 @@ void drawLightbarButton(
   uint16_t color
 );
 
-void refreshLightbarButtons();
+uint16_t getButtonColor(int command);
 
 void drawSerialScreen();
 void refreshSerialScreen();
@@ -479,9 +542,39 @@ void updateLightbarEntryRelease(
 
 bool lightbarTouchEnabled();
 
-void handleLightbarTouch(
+void handleLightbarPress(
   int x,
   int y
+);
+
+void updateLightbarPress(
+  uint8_t contacts,
+  int x,
+  int y
+);
+
+void finishLightbarPress();
+
+void executeLightbarShortPress(
+  int column,
+  int row,
+  int command
+);
+
+void executeLightbarLongPress(
+  int command
+);
+
+int getLightbarCommandAt(
+  int column,
+  int row
+);
+
+bool pointInsideLightbarButton(
+  int x,
+  int y,
+  int column,
+  int row
 );
 
 void handleSerialTouch(
@@ -500,17 +593,26 @@ void sendGigaCommand(
   bool start
 );
 
+void sendPhysicalOverride(
+  int command,
+  bool enable
+);
+
 void retryPendingCommands();
 
 void handleNanoSerial();
-void processNanoLine(char *line);
+
+void processNanoLine(
+  char *line
+);
 
 void sendHeartbeat();
 void requestSync();
 
-void updateAlarmBorder();
+bool isNanoLinkLost();
+bool isMegaLinkLost();
 
-uint16_t getButtonColor(int command);
+void updateAlarmBorder();
 
 int commandIndexFromName(
   const char *name
@@ -545,6 +647,8 @@ void setup() {
     lightbar[i].effective = false;
     lightbar[i].megaConfirmed = false;
     lightbar[i].startupHold = false;
+
+    lightbar[i].overrideActive = false;
 
     lightbar[i].failed = false;
 
@@ -631,55 +735,22 @@ void loop() {
   ) {
 
     if (
+      lastTruckDataReceived == 0 ||
       now -
       lastTruckDataReceived >
       TRUCK_DATA_TIMEOUT
     ) {
 
-      truckDataTimedOut =
-        true;
+      truckDataTimedOut = true;
+
+    } else {
+
+      truckDataTimedOut = false;
     }
 
   } else {
 
-    truckDataTimedOut =
-      false;
-  }
-
-
-  // ----------------------------------------------------------
-  // NANO WATCHDOG
-  //
-  // Any complete message from Nano refreshes this timer.
-  // ----------------------------------------------------------
-
-  if (
-    lastNanoResponse > 0 &&
-    now -
-    lastNanoResponse >
-    NANO_TIMEOUT
-  ) {
-
-    nanoLinkLost =
-      true;
-  }
-
-
-  // ----------------------------------------------------------
-  // MEGA WATCHDOG
-  //
-  // DIAG M>N PONG and MEGA_LINK_RESTORED refresh this.
-  // ----------------------------------------------------------
-
-  if (
-    lastMegaResponse > 0 &&
-    now -
-    lastMegaResponse >
-    MEGA_TIMEOUT
-  ) {
-
-    megaLinkLost =
-      true;
+    truckDataTimedOut = false;
   }
 
 
@@ -693,9 +764,7 @@ void loop() {
     FLASH_INTERVAL
   ) {
 
-    lastFlashTime =
-      now;
-
+    lastFlashTime = now;
 
     flashState =
       !flashState;
@@ -735,9 +804,7 @@ void loop() {
     GAUGE_UPDATE_INTERVAL
   ) {
 
-    lastGaugeUpdate =
-      now;
-
+    lastGaugeUpdate = now;
 
     updateGaugeDisplay();
   }
@@ -755,12 +822,70 @@ void loop() {
     SERIAL_SCREEN_INTERVAL
   ) {
 
-    lastSerialScreenDraw =
-      now;
-
+    lastSerialScreenDraw = now;
 
     refreshSerialScreen();
   }
+
+
+  // ----------------------------------------------------------
+  // Keep alarm state responsive even between flash edges.
+  // ----------------------------------------------------------
+
+  updateAlarmBorder();
+}
+
+
+// ============================================================
+// AUTHORITATIVE NANO LINK STATE
+// ============================================================
+
+bool isNanoLinkLost() {
+
+  if (
+    lastNanoResponse == 0
+  ) {
+
+    return true;
+  }
+
+
+  return (
+    millis() -
+    lastNanoResponse >
+    NANO_TIMEOUT
+  );
+}
+
+
+// ============================================================
+// AUTHORITATIVE MEGA LINK STATE
+// ============================================================
+
+bool isMegaLinkLost() {
+
+  // If Nano is unavailable, Mega cannot be verified.
+  if (
+    isNanoLinkLost()
+  ) {
+
+    return true;
+  }
+
+
+  if (
+    lastMegaResponse == 0
+  ) {
+
+    return true;
+  }
+
+
+  return (
+    millis() -
+    lastMegaResponse >
+    MEGA_TIMEOUT
+  );
 }
 
 
@@ -795,8 +920,7 @@ void updateEngineData() {
       engineData.ipr < 0
     ) {
 
-      engineData.ipr =
-        0;
+      engineData.ipr = 0;
     }
 
 
@@ -804,8 +928,7 @@ void updateEngineData() {
       engineData.ipr > 100
     ) {
 
-      engineData.ipr =
-        100;
+      engineData.ipr = 100;
     }
 
 
@@ -813,8 +936,7 @@ void updateEngineData() {
       engineData.icp < 0
     ) {
 
-      engineData.icp =
-        0;
+      engineData.icp = 0;
     }
 
 
@@ -822,8 +944,7 @@ void updateEngineData() {
       engineData.icp > 4000
     ) {
 
-      engineData.icp =
-        4000;
+      engineData.icp = 4000;
     }
   }
 
@@ -847,7 +968,6 @@ void markTruckDataReceived() {
 
   lastTruckDataReceived =
     millis();
-
 
   truckDataTimedOut =
     false;
@@ -877,6 +997,10 @@ void drawGaugeScreen() {
 
   buttonTouchActive =
     true;
+
+
+  lightbarPressActive =
+    false;
 
 
   display.fillScreen(
@@ -972,10 +1096,6 @@ void drawGaugeStatic() {
   );
 
 
-  // ----------------------------------------------------------
-  // LABELS
-  // ----------------------------------------------------------
-
   display.setTextSize(4);
 
 
@@ -1001,10 +1121,6 @@ void drawGaugeStatic() {
   );
 
 
-  // ----------------------------------------------------------
-  // GAUGE OUTLINES
-  // ----------------------------------------------------------
-
   display.drawCircle(
     IPR_CENTER_X,
     GAUGE_CENTER_Y,
@@ -1036,10 +1152,6 @@ void drawGaugeStatic() {
     COLOR_OBS_GREEN
   );
 
-
-  // ----------------------------------------------------------
-  // TICKS
-  // ----------------------------------------------------------
 
   drawGaugeTicks(
     IPR_CENTER_X,
@@ -1058,10 +1170,6 @@ void drawGaugeStatic() {
     8
   );
 
-
-  // ----------------------------------------------------------
-  // UNITS
-  // ----------------------------------------------------------
 
   display.setTextSize(2);
 
@@ -1242,10 +1350,6 @@ void updateGaugeDisplay() {
     GAUGE_SMOOTHING;
 
 
-  // ----------------------------------------------------------
-  // IPR NEEDLE
-  // ----------------------------------------------------------
-
   if (
     previousNeedleIPR < -100 ||
     fabs(
@@ -1286,10 +1390,6 @@ void updateGaugeDisplay() {
   }
 
 
-  // ----------------------------------------------------------
-  // ICP NEEDLE
-  // ----------------------------------------------------------
-
   if (
     previousNeedleICP < -100 ||
     fabs(
@@ -1329,10 +1429,6 @@ void updateGaugeDisplay() {
       displayedICP;
   }
 
-
-  // ----------------------------------------------------------
-  // DIGITAL VALUES
-  // ----------------------------------------------------------
 
   int digitalIPR =
     (int)round(
@@ -1394,8 +1490,7 @@ void drawGaugeNeedle(
     value < minimum
   ) {
 
-    value =
-      minimum;
+    value = minimum;
   }
 
 
@@ -1403,8 +1498,7 @@ void drawGaugeNeedle(
     value > maximum
   ) {
 
-    value =
-      maximum;
+    value = maximum;
   }
 
 
@@ -1584,7 +1678,7 @@ void handleTouch() {
 
 
   // ----------------------------------------------------------
-  // GAUGE SCREEN
+  // GAUGE
   // ----------------------------------------------------------
 
   if (
@@ -1603,7 +1697,7 @@ void handleTouch() {
 
 
   // ----------------------------------------------------------
-  // LIGHTBAR ENTRY RELEASE
+  // LIGHTBAR ENTRY RELEASE PROTECTION
   // ----------------------------------------------------------
 
   if (
@@ -1621,48 +1715,9 @@ void handleTouch() {
   }
 
 
-  // ----------------------------------------------------------
-  // NO TOUCH
-  // ----------------------------------------------------------
-
-  if (
-    contacts == 0
-  ) {
-
-    buttonTouchActive =
-      false;
-
-
-    return;
-  }
-
-
-  // ----------------------------------------------------------
-  // ONE ACTIVATION PER TOUCH
-  // ----------------------------------------------------------
-
-  if (
-    buttonTouchActive
-  ) {
-
-    return;
-  }
-
-
-  buttonTouchActive =
-    true;
-
-
-  int x;
-  int y;
-
-
-  mapTouchPoint(
-    touchPoints[0],
-    x,
-    y
-  );
-
+  // ==========================================================
+  // LIGHTBAR
+  // ==========================================================
 
   if (
     currentScreen ==
@@ -1677,23 +1732,777 @@ void handleTouch() {
     }
 
 
-    handleLightbarTouch(
+    // --------------------------------------------------------
+    // RELEASE
+    // --------------------------------------------------------
+
+    if (
+      contacts == 0
+    ) {
+
+      if (
+        lightbarPressActive
+      ) {
+
+        finishLightbarPress();
+      }
+
+
+      buttonTouchActive =
+        false;
+
+
+      return;
+    }
+
+
+    int x;
+    int y;
+
+
+    mapTouchPoint(
+      touchPoints[0],
       x,
       y
     );
+
+
+    // --------------------------------------------------------
+    // START PRESS
+    // --------------------------------------------------------
+
+    if (
+      !lightbarPressActive
+    ) {
+
+      handleLightbarPress(
+        x,
+        y
+      );
+
+
+      return;
+    }
+
+
+    // --------------------------------------------------------
+    // CONTINUE / HOLD
+    // --------------------------------------------------------
+
+    updateLightbarPress(
+      contacts,
+      x,
+      y
+    );
+
+
+    return;
   }
 
 
-  else if (
+  // ==========================================================
+  // SERIAL MONITOR
+  // ==========================================================
+
+  if (
     currentScreen ==
     SCREEN_SERIAL
   ) {
+
+    if (
+      contacts == 0
+    ) {
+
+      buttonTouchActive =
+        false;
+
+
+      return;
+    }
+
+
+    if (
+      buttonTouchActive
+    ) {
+
+      return;
+    }
+
+
+    buttonTouchActive =
+      true;
+
+
+    int x;
+    int y;
+
+
+    mapTouchPoint(
+      touchPoints[0],
+      x,
+      y
+    );
+
 
     handleSerialTouch(
       x,
       y
     );
   }
+}
+
+
+// ============================================================
+// START LIGHTBAR PRESS
+// ============================================================
+
+void handleLightbarPress(
+  int x,
+  int y
+) {
+
+  int column = -1;
+  int row    = -1;
+
+
+  for (
+    int c = 0;
+    c < 5;
+    c++
+  ) {
+
+    int bx =
+      BUTTON_START_X +
+      c *
+      (
+        BUTTON_W +
+        BUTTON_GAP_X
+      );
+
+
+    if (
+      x >= bx &&
+      x <
+      bx + BUTTON_W
+    ) {
+
+      column = c;
+
+      break;
+    }
+  }
+
+
+  for (
+    int r = 0;
+    r < 2;
+    r++
+  ) {
+
+    int by =
+      BUTTON_START_Y +
+      r *
+      (
+        BUTTON_H +
+        BUTTON_GAP_Y
+      );
+
+
+    if (
+      y >= by &&
+      y <
+      by + BUTTON_H
+    ) {
+
+      row = r;
+
+      break;
+    }
+  }
+
+
+  if (
+    column < 0 ||
+    row < 0
+  ) {
+
+    return;
+  }
+
+
+  lightbarPressActive =
+    true;
+
+
+  lightbarPressedColumn =
+    column;
+
+
+  lightbarPressedRow =
+    row;
+
+
+  lightbarPressedCommand =
+    getLightbarCommandAt(
+      column,
+      row
+    );
+
+
+  lightbarPressStartedAt =
+    millis();
+
+
+  lightbarLongPressHandled =
+    false;
+}
+
+
+// ============================================================
+// UPDATE LIGHTBAR PRESS / DETECT HOLD
+// ============================================================
+
+void updateLightbarPress(
+  uint8_t contacts,
+  int x,
+  int y
+) {
+
+  if (
+    !lightbarPressActive
+  ) {
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Finger moved outside original button.
+  // Cancel this press.
+  // ----------------------------------------------------------
+
+  if (
+    !pointInsideLightbarButton(
+      x,
+      y,
+      lightbarPressedColumn,
+      lightbarPressedRow
+    )
+  ) {
+
+    lightbarPressActive =
+      false;
+
+
+    lightbarPressedColumn =
+      -1;
+
+
+    lightbarPressedRow =
+      -1;
+
+
+    lightbarPressedCommand =
+      -1;
+
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Long hold only applies to actual command buttons.
+  // ----------------------------------------------------------
+
+  if (
+    lightbarPressedCommand < 0
+  ) {
+
+    return;
+  }
+
+
+  if (
+    lightbarLongPressHandled
+  ) {
+
+    return;
+  }
+
+
+  if (
+    millis() -
+    lightbarPressStartedAt <
+    OVERRIDE_HOLD_TIME
+  ) {
+
+    return;
+  }
+
+
+  LightbarState &s =
+    lightbar[
+      lightbarPressedCommand
+    ];
+
+
+  // ----------------------------------------------------------
+  // Physical switch must currently be ON.
+  //
+  // This covers:
+  //   solid blue
+  //   flashing blue
+  //   red
+  // ----------------------------------------------------------
+
+  if (
+    s.physical
+  ) {
+
+    lightbarLongPressHandled =
+      true;
+
+
+    executeLightbarLongPress(
+      lightbarPressedCommand
+    );
+  }
+}
+
+
+// ============================================================
+// FINISH LIGHTBAR PRESS
+// ============================================================
+
+void finishLightbarPress() {
+
+  if (
+    !lightbarPressActive
+  ) {
+
+    return;
+  }
+
+
+  int column =
+    lightbarPressedColumn;
+
+
+  int row =
+    lightbarPressedRow;
+
+
+  int command =
+    lightbarPressedCommand;
+
+
+  bool longHandled =
+    lightbarLongPressHandled;
+
+
+  lightbarPressActive =
+    false;
+
+
+  lightbarPressedColumn =
+    -1;
+
+
+  lightbarPressedRow =
+    -1;
+
+
+  lightbarPressedCommand =
+    -1;
+
+
+  lightbarLongPressHandled =
+    false;
+
+
+  // ----------------------------------------------------------
+  // Long press already performed override.
+  // Do NOT also execute short press.
+  // ----------------------------------------------------------
+
+  if (
+    longHandled
+  ) {
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // If physical switch is active, a short tap intentionally
+  // does nothing.
+  //
+  // Physical control is changed only with long press.
+  // ----------------------------------------------------------
+
+  if (
+    command >= 0 &&
+    lightbar[command].physical
+  ) {
+
+    return;
+  }
+
+
+  executeLightbarShortPress(
+    column,
+    row,
+    command
+  );
+}
+
+
+// ============================================================
+// LIGHTBAR SHORT PRESS
+// ============================================================
+
+void executeLightbarShortPress(
+  int column,
+  int row,
+  int command
+) {
+
+  // ==========================================================
+  // ROW 1 NORMAL COMMANDS
+  // ==========================================================
+
+  if (
+    row == 0
+  ) {
+
+    if (
+      command >= 0
+    ) {
+
+      sendGigaCommand(
+        command,
+        !lightbar[
+          command
+        ].giga
+      );
+    }
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // ROW 2
+  // ==========================================================
+
+  switch (
+    column
+  ) {
+
+    // CLOSE
+    case 0:
+
+      drawGaugeScreen();
+
+      break;
+
+
+    // TA LEFT
+    case 1:
+
+      if (
+        command >= 0
+      ) {
+
+        sendGigaCommand(
+          command,
+          !lightbar[
+            command
+          ].giga
+        );
+      }
+
+      break;
+
+
+    // TA OUT
+    case 2:
+
+      if (
+        command >= 0
+      ) {
+
+        sendGigaCommand(
+          command,
+          !lightbar[
+            command
+          ].giga
+        );
+      }
+
+      break;
+
+
+    // TA RIGHT
+    case 3:
+
+      if (
+        command >= 0
+      ) {
+
+        sendGigaCommand(
+          command,
+          !lightbar[
+            command
+          ].giga
+        );
+      }
+
+      break;
+
+
+    // MONITOR
+    case 4:
+
+      drawSerialScreen();
+
+      break;
+  }
+}
+
+
+// ============================================================
+// LIGHTBAR LONG PRESS
+// ============================================================
+
+void executeLightbarLongPress(
+  int command
+) {
+
+  if (
+    command < 0 ||
+    command >= NUM_COMMANDS
+  ) {
+
+    return;
+  }
+
+
+  LightbarState &s =
+    lightbar[command];
+
+
+  if (
+    !s.physical
+  ) {
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // BLUE / FLASHING BLUE:
+  // Apply physical override.
+  // ----------------------------------------------------------
+
+  if (
+    !s.overrideActive
+  ) {
+
+    sendPhysicalOverride(
+      command,
+      true
+    );
+
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // RED:
+  // Remove physical override.
+  // ----------------------------------------------------------
+
+  sendPhysicalOverride(
+    command,
+    false
+  );
+}
+
+
+// ============================================================
+// COMMAND ASSOCIATED WITH BUTTON
+// ============================================================
+
+int getLightbarCommandAt(
+  int column,
+  int row
+) {
+
+  if (
+    row == 0
+  ) {
+
+    switch (
+      column
+    ) {
+
+      case 0:
+        return CMD_TRAFFICBREAKERS;
+
+      case 1:
+        return CMD_INNERS;
+
+      case 2:
+        return CMD_INTERMEDIATES;
+
+      case 3:
+        return CMD_OUTERS;
+
+      case 4:
+        return CMD_LEDS;
+    }
+  }
+
+
+  if (
+    row == 1
+  ) {
+
+    switch (
+      column
+    ) {
+
+      case 1:
+        return CMD_TLEFT;
+
+      case 2:
+        return CMD_TOUT;
+
+      case 3:
+        return CMD_TRIGHT;
+    }
+  }
+
+
+  return -1;
+}
+
+
+// ============================================================
+// POINT INSIDE BUTTON
+// ============================================================
+
+bool pointInsideLightbarButton(
+  int x,
+  int y,
+  int column,
+  int row
+) {
+
+  if (
+    column < 0 ||
+    column >= 5 ||
+    row < 0 ||
+    row >= 2
+  ) {
+
+    return false;
+  }
+
+
+  int bx =
+    BUTTON_START_X +
+    column *
+    (
+      BUTTON_W +
+      BUTTON_GAP_X
+    );
+
+
+  int by =
+    BUTTON_START_Y +
+    row *
+    (
+      BUTTON_H +
+      BUTTON_GAP_Y
+    );
+
+
+  return (
+    x >= bx &&
+    x <
+    bx + BUTTON_W &&
+    y >= by &&
+    y <
+    by + BUTTON_H
+  );
+}
+
+
+// ============================================================
+// SEND PHYSICAL OVERRIDE
+// ============================================================
+
+void sendPhysicalOverride(
+  int command,
+  bool enable
+) {
+
+  if (
+    command < 0 ||
+    command >= NUM_COMMANDS
+  ) {
+
+    return;
+  }
+
+
+  char message[80];
+
+
+  snprintf(
+    message,
+    sizeof(message),
+    "OVERRIDE %s %s",
+    commandNames[command],
+    enable ?
+      "ON" :
+      "OFF"
+  );
+
+
+  NanoSerial.println(
+    message
+  );
+
+
+  addSerialMessage(
+    "G>N",
+    message
+  );
+
+
+  /*
+    IMPORTANT:
+
+    We deliberately do NOT change overrideActive locally.
+
+    Nano is authoritative.
+
+    Button becomes RED only after Nano reports:
+
+      STATE <COMMAND> ... O=1
+
+    and returns from RED only after Nano reports:
+
+      STATE <COMMAND> ... O=0
+
+    This prevents the display from claiming an override exists
+    when the Nano never actually received it.
+  */
 }
 
 
@@ -1741,10 +2550,6 @@ void handleSecretGesture(
     }
 
 
-    // --------------------------------------------------------
-    // START
-    // --------------------------------------------------------
-
     if (
       !secretGestureTracking
     ) {
@@ -1781,10 +2586,6 @@ void handleSecretGesture(
     }
 
 
-    // --------------------------------------------------------
-    // TRACK
-    // --------------------------------------------------------
-
     if (
       averageRawX <
       secretLowestRawX
@@ -1799,10 +2600,6 @@ void handleSecretGesture(
       secretStartRawX -
       secretLowestRawX;
 
-
-    // --------------------------------------------------------
-    // TRIGGER
-    // --------------------------------------------------------
 
     if (
       !secretGestureTriggered &&
@@ -1828,10 +2625,6 @@ void handleSecretGesture(
     return;
   }
 
-
-  // ----------------------------------------------------------
-  // TEMPORARY TOUCH DROPOUT
-  // ----------------------------------------------------------
 
   if (
     secretGestureTracking ||
@@ -1933,6 +2726,10 @@ void updateLightbarEntryRelease(
 
     buttonTouchActive =
       false;
+
+
+    lightbarPressActive =
+      false;
   }
 }
 
@@ -1995,10 +2792,6 @@ void drawLightbarScreen() {
     SCREEN_LIGHTBAR;
 
 
-  // ----------------------------------------------------------
-  // ENTRY SAFETY
-  // ----------------------------------------------------------
-
   lightbarScreenOpenedAt =
     millis();
 
@@ -2015,9 +2808,25 @@ void drawLightbarScreen() {
     true;
 
 
-  // ----------------------------------------------------------
-  // SCREEN
-  // ----------------------------------------------------------
+  lightbarPressActive =
+    false;
+
+
+  lightbarPressedColumn =
+    -1;
+
+
+  lightbarPressedRow =
+    -1;
+
+
+  lightbarPressedCommand =
+    -1;
+
+
+  lightbarLongPressHandled =
+    false;
+
 
   display.fillScreen(
     COLOR_BLACK
@@ -2064,10 +2873,6 @@ void drawLightbarScreen() {
 // ============================================================
 
 void refreshLightbarButtons() {
-
-  // ----------------------------------------------------------
-  // ROW 1
-  // ----------------------------------------------------------
 
   drawLightbarButton(
     0,
@@ -2118,10 +2923,6 @@ void refreshLightbarButtons() {
     )
   );
 
-
-  // ----------------------------------------------------------
-  // ROW 2
-  // ----------------------------------------------------------
 
   drawLightbarButton(
     0,
@@ -2225,10 +3026,6 @@ void drawLightbarButton(
   );
 
 
-  // ----------------------------------------------------------
-  // TRAFFIC BREAKER
-  // ----------------------------------------------------------
-
   if (
     strcmp(
       label,
@@ -2264,10 +3061,6 @@ void drawLightbarButton(
     return;
   }
 
-
-  // ----------------------------------------------------------
-  // NORMAL LABEL
-  // ----------------------------------------------------------
 
   display.setTextSize(2);
 
@@ -2306,7 +3099,7 @@ void drawLightbarButton(
 
 
 // ============================================================
-// BUTTON COLOR / STATE
+// BUTTON COLOR
 // ============================================================
 
 uint16_t getButtonColor(
@@ -2318,39 +3111,49 @@ uint16_t getButtonColor(
 
 
   // ==========================================================
-  // 1. PHYSICAL SWITCH
+  // 1. PHYSICAL SWITCH ON + OVERRIDDEN
   //
-  // Physical indication has highest visual priority.
+  // RED has highest physical-state priority.
+  // ==========================================================
+
+  if (
+    s.physical &&
+    s.overrideActive
+  ) {
+
+    return COLOR_RED;
+  }
+
+
+  // ==========================================================
+  // 2. PHYSICAL STARTUP HOLD
+  // ==========================================================
+
+  if (
+    s.physical &&
+    s.startupHold
+  ) {
+
+    return flashState ?
+      COLOR_BLUE :
+      COLOR_BLACK;
+  }
+
+
+  // ==========================================================
+  // 3. NORMAL PHYSICAL CONTROL
   // ==========================================================
 
   if (
     s.physical
   ) {
 
-    // Startup-held physical request:
-    // FLASHING BLUE
-
-    if (
-      s.startupHold
-    ) {
-
-      return flashState ?
-        COLOR_BLUE :
-        COLOR_BLACK;
-    }
-
-
-    // Normal physical request:
-    // SOLID BLUE
-
     return COLOR_BLUE;
   }
 
 
   // ==========================================================
-  // 2. GIGA COMMAND PENDING
-  //
-  // FLASHING PURPLE
+  // 4. PENDING GIGA START/STOP
   // ==========================================================
 
   if (
@@ -2364,9 +3167,7 @@ uint16_t getButtonColor(
 
 
   // ==========================================================
-  // 3. GIGA COMMAND FAILED
-  //
-  // SOLID PURPLE
+  // 5. GIGA COMMAND GAVE UP
   // ==========================================================
 
   if (
@@ -2378,9 +3179,7 @@ uint16_t getButtonColor(
 
 
   // ==========================================================
-  // 4. CONFIRMED GIGA START
-  //
-  // SOLID GREEN
+  // 6. CONFIRMED GIGA CONTROL
   // ==========================================================
 
   if (
@@ -2392,270 +3191,12 @@ uint16_t getButtonColor(
   }
 
 
-  // ==========================================================
-  // 5. INACTIVE
-  // ==========================================================
-
   return COLOR_BLACK;
 }
 
 
 // ============================================================
-// LIGHTBAR TOUCH
-// ============================================================
-
-void handleLightbarTouch(
-  int x,
-  int y
-) {
-
-  if (
-    !lightbarTouchEnabled()
-  ) {
-
-    return;
-  }
-
-
-  int column =
-    -1;
-
-
-  int row =
-    -1;
-
-
-  // ----------------------------------------------------------
-  // FIND COLUMN
-  // ----------------------------------------------------------
-
-  for (
-    int c = 0;
-    c < 5;
-    c++
-  ) {
-
-    int bx =
-      BUTTON_START_X +
-      c *
-      (
-        BUTTON_W +
-        BUTTON_GAP_X
-      );
-
-
-    if (
-      x >= bx &&
-      x <
-      bx + BUTTON_W
-    ) {
-
-      column =
-        c;
-
-
-      break;
-    }
-  }
-
-
-  // ----------------------------------------------------------
-  // FIND ROW
-  // ----------------------------------------------------------
-
-  for (
-    int r = 0;
-    r < 2;
-    r++
-  ) {
-
-    int by =
-      BUTTON_START_Y +
-      r *
-      (
-        BUTTON_H +
-        BUTTON_GAP_Y
-      );
-
-
-    if (
-      y >= by &&
-      y <
-      by + BUTTON_H
-    ) {
-
-      row =
-        r;
-
-
-      break;
-    }
-  }
-
-
-  if (
-    column < 0 ||
-    row < 0
-  ) {
-
-    return;
-  }
-
-
-  // ==========================================================
-  // ROW 1
-  // ==========================================================
-
-  if (
-    row == 0
-  ) {
-
-    int command =
-      -1;
-
-
-    switch (
-      column
-    ) {
-
-      case 0:
-
-        command =
-          CMD_TRAFFICBREAKERS;
-
-        break;
-
-
-      case 1:
-
-        command =
-          CMD_INNERS;
-
-        break;
-
-
-      case 2:
-
-        command =
-          CMD_INTERMEDIATES;
-
-        break;
-
-
-      case 3:
-
-        command =
-          CMD_OUTERS;
-
-        break;
-
-
-      case 4:
-
-        command =
-          CMD_LEDS;
-
-        break;
-    }
-
-
-    if (
-      command >= 0
-    ) {
-
-      sendGigaCommand(
-        command,
-        !lightbar[command].giga
-      );
-    }
-
-
-    return;
-  }
-
-
-  // ==========================================================
-  // ROW 2
-  // ==========================================================
-
-  switch (
-    column
-  ) {
-
-    // --------------------------------------------------------
-    // CLOSE -> GAUGE SCREEN
-    // --------------------------------------------------------
-
-    case 0:
-
-      drawGaugeScreen();
-
-      break;
-
-
-    // --------------------------------------------------------
-    // TA LEFT
-    // --------------------------------------------------------
-
-    case 1:
-
-      sendGigaCommand(
-        CMD_TLEFT,
-        !lightbar[
-          CMD_TLEFT
-        ].giga
-      );
-
-      break;
-
-
-    // --------------------------------------------------------
-    // TA OUT
-    // --------------------------------------------------------
-
-    case 2:
-
-      sendGigaCommand(
-        CMD_TOUT,
-        !lightbar[
-          CMD_TOUT
-        ].giga
-      );
-
-      break;
-
-
-    // --------------------------------------------------------
-    // TA RIGHT
-    // --------------------------------------------------------
-
-    case 3:
-
-      sendGigaCommand(
-        CMD_TRIGHT,
-        !lightbar[
-          CMD_TRIGHT
-        ].giga
-      );
-
-      break;
-
-
-    // --------------------------------------------------------
-    // MONITOR
-    // --------------------------------------------------------
-
-    case 4:
-
-      drawSerialScreen();
-
-      break;
-  }
-}
-
-
-// ============================================================
-// SEND GIGA COMMAND
+// SEND NORMAL GIGA COMMAND
 // ============================================================
 
 void sendGigaCommand(
@@ -2681,10 +3222,6 @@ void sendGigaCommand(
     millis();
 
 
-  // ==========================================================
-  // BEGIN NEW TRANSACTION
-  // ==========================================================
-
   s.pendingStart =
     start;
 
@@ -2705,8 +3242,6 @@ void sendGigaCommand(
     now;
 
 
-  // Clear any previous terminal failure.
-
   s.failed =
     false;
 
@@ -2715,15 +3250,9 @@ void sendGigaCommand(
     '\0';
 
 
-  // Store desired GIGA state immediately.
-
   s.giga =
     start;
 
-
-  // ==========================================================
-  // IMMEDIATELY DISPLAY FLASHING PURPLE
-  // ==========================================================
 
   if (
     currentScreen ==
@@ -2733,10 +3262,6 @@ void sendGigaCommand(
     refreshLightbarButtons();
   }
 
-
-  // ==========================================================
-  // TRANSMIT COMMAND
-  // ==========================================================
 
   char message[64];
 
@@ -2765,7 +3290,7 @@ void sendGigaCommand(
 
 
 // ============================================================
-// RETRY PENDING GIGA COMMANDS
+// RETRY NORMAL GIGA COMMANDS
 // ============================================================
 
 void retryPendingCommands() {
@@ -2784,10 +3309,6 @@ void retryPendingCommands() {
       lightbar[i];
 
 
-    // --------------------------------------------------------
-    // NOTHING PENDING
-    // --------------------------------------------------------
-
     if (
       !s.waitingForConfirmation
     ) {
@@ -2796,9 +3317,9 @@ void retryPendingCommands() {
     }
 
 
-    // ========================================================
-    // 30-SECOND TOTAL TIMEOUT
-    // ========================================================
+    // --------------------------------------------------------
+    // 30 SECOND TOTAL TIMEOUT
+    // --------------------------------------------------------
 
     if (
       now -
@@ -2834,10 +3355,6 @@ void retryPendingCommands() {
       ] = '\0';
 
 
-      // ------------------------------------------------------
-      // SERIAL MONITOR ERROR
-      // ------------------------------------------------------
-
       char errorMessage[80];
 
 
@@ -2858,10 +3375,6 @@ void retryPendingCommands() {
       );
 
 
-      // ------------------------------------------------------
-      // SOLID PURPLE
-      // ------------------------------------------------------
-
       if (
         currentScreen ==
         SCREEN_LIGHTBAR
@@ -2875,9 +3388,9 @@ void retryPendingCommands() {
     }
 
 
-    // ========================================================
-    // WAIT UNTIL NEXT 5-SECOND RETRY
-    // ========================================================
+    // --------------------------------------------------------
+    // 5 SECOND RETRY INTERVAL
+    // --------------------------------------------------------
 
     if (
       now -
@@ -2888,10 +3401,6 @@ void retryPendingCommands() {
       continue;
     }
 
-
-    // ========================================================
-    // RESEND COMMAND
-    // ========================================================
 
     s.commandSentAt =
       now;
@@ -2965,7 +3474,7 @@ void sendHeartbeat() {
 
 
 // ============================================================
-// REQUEST SYNC
+// REQUEST STATE SYNC
 // ============================================================
 
 void requestSync() {
@@ -3069,25 +3578,25 @@ void processNanoLine(
   char *line
 ) {
 
-  // ==========================================================
-  // ANY COMPLETE NANO MESSAGE PROVES NANO IS ALIVE
-  // ==========================================================
+  // ----------------------------------------------------------
+  // Capture previous state BEFORE refreshing timestamp.
+  // ----------------------------------------------------------
+
+  bool nanoWasLost =
+    isNanoLinkLost();
+
+
+  // ----------------------------------------------------------
+  // ANY complete Nano line proves Nano is currently alive.
+  // ----------------------------------------------------------
 
   lastNanoResponse =
     millis();
 
 
-  bool nanoWasLost =
-    nanoLinkLost;
-
-
-  nanoLinkLost =
-    false;
-
-
-  // ----------------------------------------------------------
+  // ==========================================================
   // GIGA PONG
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (
     strcmp(
@@ -3111,9 +3620,9 @@ void processNanoLine(
   }
 
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // NANO BOOT
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (
     strcmp(
@@ -3121,6 +3630,11 @@ void processNanoLine(
       "NANO_BOOT"
     ) == 0
   ) {
+
+    // Mega verification from before a Nano reboot is stale.
+    lastMegaResponse =
+      0;
+
 
     requestSync();
 
@@ -3132,9 +3646,9 @@ void processNanoLine(
   }
 
 
-  // ----------------------------------------------------------
-  // FORWARDED MEGA PONG
-  // ----------------------------------------------------------
+  // ==========================================================
+  // VERIFIED FORWARDED MEGA PONG
+  // ==========================================================
 
   if (
     strcmp(
@@ -3147,10 +3661,6 @@ void processNanoLine(
       millis();
 
 
-    megaLinkLost =
-      false;
-
-
     updateAlarmBorder();
 
 
@@ -3158,9 +3668,9 @@ void processNanoLine(
   }
 
 
-  // ----------------------------------------------------------
-  // MEGA LINK LOST
-  // ----------------------------------------------------------
+  // ==========================================================
+  // EXPLICIT MEGA LINK LOST
+  // ==========================================================
 
   if (
     strcmp(
@@ -3169,8 +3679,8 @@ void processNanoLine(
     ) == 0
   ) {
 
-    megaLinkLost =
-      true;
+    lastMegaResponse =
+      0;
 
 
     updateAlarmBorder();
@@ -3180,9 +3690,9 @@ void processNanoLine(
   }
 
 
-  // ----------------------------------------------------------
-  // MEGA LINK RESTORED
-  // ----------------------------------------------------------
+  // ==========================================================
+  // EXPLICIT MEGA LINK RESTORED
+  // ==========================================================
 
   if (
     strcmp(
@@ -3195,10 +3705,6 @@ void processNanoLine(
       millis();
 
 
-    megaLinkLost =
-      false;
-
-
     updateAlarmBorder();
 
 
@@ -3207,11 +3713,7 @@ void processNanoLine(
 
 
   // ==========================================================
-  // ACK
-  //
-  // Nano ACK does NOT stop purple flashing or retries.
-  //
-  // Only CONFIRMED ends a successful transaction.
+  // NORMAL START/STOP ACK
   // ==========================================================
 
   if (
@@ -3258,7 +3760,103 @@ void processNanoLine(
 
 
   // ==========================================================
-  // CONFIRMED
+  // OVERRIDE ACK
+  //
+  // Example:
+  // ACK OVERRIDE OUTERS ON
+  //
+  // STATE remains authoritative for actual O value.
+  // ==========================================================
+
+  if (
+    strncmp(
+      line,
+      "ACK OVERRIDE ",
+      13
+    ) == 0
+  ) {
+
+    return;
+  }
+
+
+  // ==========================================================
+  // OVERRIDE CONFIRMATION
+  //
+  // Example:
+  // CONFIRMED OVERRIDE OUTERS ON
+  //
+  // We still prefer STATE O= as authoritative, but accepting
+  // this makes the UI responsive immediately.
+  // ==========================================================
+
+  if (
+    strncmp(
+      line,
+      "CONFIRMED OVERRIDE ",
+      19
+    ) == 0
+  ) {
+
+    char commandName[32];
+    char stateText[8];
+
+
+    if (
+      sscanf(
+        line,
+        "CONFIRMED OVERRIDE %31s %7s",
+        commandName,
+        stateText
+      ) == 2
+    ) {
+
+      int index =
+        commandIndexFromName(
+          commandName
+        );
+
+
+      if (
+        index >= 0
+      ) {
+
+        bool enabled =
+          strcasecmp(
+            stateText,
+            "ON"
+          ) == 0;
+
+
+        // Override only visually exists while physical switch
+        // itself is still reported ON.
+
+        lightbar[
+          index
+        ].overrideActive =
+          enabled &&
+          lightbar[
+            index
+          ].physical;
+
+
+        if (
+          currentScreen ==
+          SCREEN_LIGHTBAR
+        ) {
+
+          refreshLightbarButtons();
+        }
+      }
+    }
+
+
+    return;
+  }
+
+
+  // ==========================================================
+  // NORMAL CONFIRMED START / STOP
   // ==========================================================
 
   if (
@@ -3299,10 +3897,6 @@ void processNanoLine(
           ) == 0;
 
 
-        // ----------------------------------------------------
-        // FINAL CONFIRMED STATE
-        // ----------------------------------------------------
-
         lightbar[
           index
         ].megaConfirmed =
@@ -3314,10 +3908,6 @@ void processNanoLine(
         ].giga =
           start;
 
-
-        // ----------------------------------------------------
-        // END TRANSACTION
-        // ----------------------------------------------------
 
         lightbar[
           index
@@ -3359,14 +3949,10 @@ void processNanoLine(
 
 
   // ==========================================================
-  // FAILED
+  // FAILED START / STOP
   //
-  // IMPORTANT:
-  //
-  // This only means the individual Nano/Mega attempt failed.
-  //
-  // The GIGA continues retrying every 5 seconds until the
-  // overall 30-second timer expires.
+  // Individual attempt failed.
+  // GIGA continues retrying until 30-second total timeout.
   // ==========================================================
 
   if (
@@ -3410,20 +3996,10 @@ void processNanoLine(
         index >= 0
       ) {
 
-        // Latest attempt is no longer awaiting initial ACK.
-
         lightbar[
           index
         ].nanoAckPending =
           false;
-
-
-        // DO NOT:
-        //
-        //   clear waitingForConfirmation
-        //   set failed = true
-        //
-        // GIGA retry system remains active.
 
 
         if (
@@ -3471,7 +4047,11 @@ void processNanoLine(
 
 
   // ==========================================================
-  // STATE
+  // STATE WITH OVERRIDE FIELD
+  //
+  // New format:
+  //
+  // STATE OUTERS P=1 G=0 E=0 M=0 H=0 O=1
   // ==========================================================
 
   if (
@@ -3484,73 +4064,136 @@ void processNanoLine(
 
     char commandName[32];
 
-    int p;
-    int g;
-    int e;
-    int m;
-    int h;
+    int p = 0;
+    int g = 0;
+    int e = 0;
+    int m = 0;
+    int h = 0;
+    int o = 0;
 
 
-    if (
+    int fields =
       sscanf(
         line,
-        "STATE %31s P=%d G=%d E=%d M=%d H=%d",
+        "STATE %31s P=%d G=%d E=%d M=%d H=%d O=%d",
         commandName,
         &p,
         &g,
         &e,
         &m,
-        &h
-      ) == 6
+        &h,
+        &o
+      );
+
+
+    // --------------------------------------------------------
+    // Backward compatibility:
+    //
+    // Old Nano:
+    // STATE ... P= G= E= M= H=
+    // --------------------------------------------------------
+
+    if (
+      fields < 6
     ) {
 
-      int index =
-        commandIndexFromName(
-          commandName
-        );
+      return;
+    }
 
+
+    int index =
+      commandIndexFromName(
+        commandName
+      );
+
+
+    if (
+      index >= 0
+    ) {
+
+      lightbar[
+        index
+      ].physical =
+        p != 0;
+
+
+      lightbar[
+        index
+      ].giga =
+        g != 0;
+
+
+      lightbar[
+        index
+      ].effective =
+        e != 0;
+
+
+      lightbar[
+        index
+      ].megaConfirmed =
+        m != 0;
+
+
+      lightbar[
+        index
+      ].startupHold =
+        h != 0;
+
+
+      // ------------------------------------------------------
+      // If new O field exists, use it.
+      //
+      // If physical switch is OFF, override must visually
+      // disappear regardless.
+      // ------------------------------------------------------
 
       if (
-        index >= 0
+        fields >= 7
       ) {
 
         lightbar[
           index
-        ].physical =
-          p != 0;
+        ].overrideActive =
+          (
+            o != 0 &&
+            p != 0
+          );
 
-
-        lightbar[
-          index
-        ].giga =
-          g != 0;
-
-
-        lightbar[
-          index
-        ].effective =
-          e != 0;
-
+      } else if (
+        p == 0
+      ) {
 
         lightbar[
           index
-        ].megaConfirmed =
-          m != 0;
+        ].overrideActive =
+          false;
+      }
 
+
+      // ------------------------------------------------------
+      // Physical OFF guarantees red disappears.
+      // ------------------------------------------------------
+
+      if (
+        !lightbar[
+          index
+        ].physical
+      ) {
 
         lightbar[
           index
-        ].startupHold =
-          h != 0;
+        ].overrideActive =
+          false;
+      }
 
 
-        if (
-          currentScreen ==
-          SCREEN_LIGHTBAR
-        ) {
+      if (
+        currentScreen ==
+        SCREEN_LIGHTBAR
+      ) {
 
-          refreshLightbarButtons();
-        }
+        refreshLightbarButtons();
       }
     }
 
@@ -3559,9 +4202,9 @@ void processNanoLine(
   }
 
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // SYNC
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (
     strcmp(
@@ -3585,9 +4228,9 @@ void processNanoLine(
   }
 
 
-  // ----------------------------------------------------------
-  // DIAGNOSTICS / HOLD
-  // ----------------------------------------------------------
+  // ==========================================================
+  // DIAGNOSTIC / HOLD
+  // ==========================================================
 
   if (
     strncmp(
@@ -3712,14 +4355,14 @@ void drawSerialScreen() {
     true;
 
 
+  lightbarPressActive =
+    false;
+
+
   display.fillScreen(
     COLOR_BLACK
   );
 
-
-  // ----------------------------------------------------------
-  // TITLE
-  // ----------------------------------------------------------
 
   display.setTextColor(
     COLOR_WHITE,
@@ -3741,16 +4384,8 @@ void drawSerialScreen() {
   );
 
 
-  // ----------------------------------------------------------
-  // LINK STATUS
-  // ----------------------------------------------------------
-
   drawSerialLinkStatus();
 
-
-  // ----------------------------------------------------------
-  // CLOSE X
-  // ----------------------------------------------------------
 
   display.drawRect(
     748,
@@ -3781,10 +4416,6 @@ void drawSerialScreen() {
   );
 
 
-  // ----------------------------------------------------------
-  // SERIAL HISTORY
-  // ----------------------------------------------------------
-
   refreshSerialScreen();
 
 
@@ -3805,6 +4436,14 @@ void drawSerialScreen() {
 // ============================================================
 
 void drawSerialLinkStatus() {
+
+  bool nanoLost =
+    isNanoLinkLost();
+
+
+  bool megaLost =
+    isMegaLinkLost();
+
 
   display.fillRect(
     300,
@@ -3840,7 +4479,7 @@ void drawSerialLinkStatus() {
 
 
   if (
-    nanoLinkLost
+    nanoLost
   ) {
 
     display.setTextColor(
@@ -3889,7 +4528,7 @@ void drawSerialLinkStatus() {
 
 
   if (
-    megaLinkLost
+    megaLost
   ) {
 
     display.setTextColor(
@@ -3940,8 +4579,7 @@ void refreshSerialScreen() {
     visible > 23
   ) {
 
-    visible =
-      23;
+    visible = 23;
   }
 
 
@@ -3959,8 +4597,7 @@ void refreshSerialScreen() {
   }
 
 
-  int y =
-    56;
+  int y = 56;
 
 
   display.setTextSize(1);
@@ -4079,8 +4716,7 @@ void refreshSerialScreen() {
     );
 
 
-    y +=
-      17;
+    y += 17;
   }
 
 
@@ -4089,7 +4725,7 @@ void refreshSerialScreen() {
 
 
 // ============================================================
-// SERIAL MONITOR TOUCH
+// SERIAL TOUCH
 // ============================================================
 
 void handleSerialTouch(
@@ -4097,9 +4733,7 @@ void handleSerialTouch(
   int y
 ) {
 
-  // ----------------------------------------------------------
-  // X -> LIGHTBAR CONTROLLER
-  // ----------------------------------------------------------
+  // X returns to LIGHTBAR, not gauges.
 
   if (
     x >= 735 &&
@@ -4122,11 +4756,9 @@ void updateAlarmBorder() {
 
 
   // ----------------------------------------------------------
-  // GAUGE SCREEN
+  // GAUGE:
   //
-  // ONLY:
-  //   simulation
-  //   truck data timeout
+  // ONLY engine simulation or truck-data timeout.
   // ----------------------------------------------------------
 
   if (
@@ -4141,11 +4773,9 @@ void updateAlarmBorder() {
 
 
   // ----------------------------------------------------------
-  // LIGHTBAR / SERIAL
+  // LIGHTBAR / SERIAL:
   //
-  // ONLY:
-  //   Nano communication lost
-  //   Mega communication lost
+  // ONLY Nano or Mega communications.
   // ----------------------------------------------------------
 
   else if (
@@ -4156,8 +4786,8 @@ void updateAlarmBorder() {
   ) {
 
     alarm =
-      nanoLinkLost ||
-      megaLinkLost;
+      isNanoLinkLost() ||
+      isMegaLinkLost();
   }
 
 
@@ -4191,8 +4821,8 @@ void updateAlarmBorder() {
 
   uint16_t borderColor =
     borderVisible ?
-    COLOR_RED :
-    COLOR_BLACK;
+      COLOR_RED :
+      COLOR_BLACK;
 
 
   display.drawRect(
